@@ -2,7 +2,7 @@
  * context.ts — Extract parent conversation context for subagent inheritance.
  */
 
-import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { buildSessionContext, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 
 /** Extract text from a message content block array. */
 export function extractText(content: unknown[]): string {
@@ -18,30 +18,23 @@ export function extractText(content: unknown[]): string {
  * into what has been discussed/done so far.
  */
 export function buildParentContext(ctx: ExtensionContext): string {
-  const entries = ctx.sessionManager.getBranch();
-  if (!entries || entries.length === 0) return "";
-
+  // Pi applies the latest compaction boundary, including custom compactor summaries.
+  const { messages } = buildSessionContext(ctx.sessionManager.getBranch());
   const parts: string[] = [];
 
-  for (const entry of entries) {
-    if (entry.type === "message") {
-      const msg = entry.message;
-      if (msg.role === "user") {
-        const text = typeof msg.content === "string"
-          ? msg.content
-          : extractText(msg.content);
-        if (text.trim()) parts.push(`[User]: ${text.trim()}`);
-      } else if (msg.role === "assistant") {
-        const text = extractText(msg.content);
-        if (text.trim()) parts.push(`[Assistant]: ${text.trim()}`);
-      }
-      // Skip toolResult messages — too verbose for context
-    } else if (entry.type === "compaction") {
-      // Include compaction summaries — they're already condensed
-      if (entry.summary) {
-        parts.push(`[Summary]: ${entry.summary}`);
-      }
+  for (const msg of messages) {
+    if (msg.role === "user") {
+      const text = typeof msg.content === "string"
+        ? msg.content
+        : extractText(msg.content);
+      if (text.trim()) parts.push(`[User]: ${text.trim()}`);
+    } else if (msg.role === "assistant") {
+      const text = extractText(msg.content);
+      if (text.trim()) parts.push(`[Assistant]: ${text.trim()}`);
+    } else if (msg.role === "compactionSummary" || msg.role === "branchSummary") {
+      if (msg.summary) parts.push(`[Summary]: ${msg.summary}`);
     }
+    // Skip toolResult messages — too verbose for context
   }
 
   if (parts.length === 0) return "";

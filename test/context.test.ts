@@ -4,15 +4,22 @@
  * buildParentContext shapes what a subagent sees from its parent; silent bugs
  * here would feed wrong context into spawns. Tests use realistic SessionEntry
  * shapes and a minimal ExtensionContext stub — no mocking beyond the one
- * getBranch() call the function actually reads.
+ * getBranch() call the function actually reads. Compaction tests also use Pi's
+ * in-memory session manager, without model calls or persisted sessions.
  */
 
-import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { type ExtensionContext, type SessionEntry, SessionManager } from "@earendil-works/pi-coding-agent";
 import { describe, expect, it } from "vitest";
 import { buildParentContext, extractText } from "../src/context.js";
 
 function makeCtx(entries: unknown[]): ExtensionContext {
-  return { sessionManager: { getBranch: () => entries } } as unknown as ExtensionContext;
+  const branch = entries.map((entry, index) => ({
+    ...(entry as object),
+    id: `entry-${index}`,
+    parentId: index === 0 ? null : `entry-${index - 1}`,
+    timestamp: "2026-01-01T00:00:00.000Z",
+  })) as SessionEntry[];
+  return { sessionManager: { getBranch: () => branch } } as unknown as ExtensionContext;
 }
 
 function userMsg(content: string | unknown[]) {
@@ -80,18 +87,67 @@ describe("buildParentContext", () => {
     expect(out).toContain("[User]: from blocks");
   });
 
-  it("includes compaction summaries inline in their original position", () => {
+  it("replaces summarized history and puts the summary before the retained messages", () => {
     const out = buildParentContext(
       makeCtx([
         userMsg("orig question"),
-        { type: "compaction", summary: "we discussed X" },
+        userMsg("retained question"),
+        { type: "compaction", summary: "we discussed X", firstKeptEntryId: "entry-1" },
         assistantMsg([{ type: "text", text: "follow-up" }]),
       ]),
     );
-    expect(out.indexOf("[User]: orig question"))
-      .toBeLessThan(out.indexOf("[Summary]: we discussed X"));
-    expect(out.indexOf("[Summary]: we discussed X"))
-      .toBeLessThan(out.indexOf("[Assistant]: follow-up"));
+    expect(out).not.toContain("orig question");
+    expect(out).toContain("[Summary]: we discussed X\n\n[User]: retained question\n\n[Assistant]: follow-up");
+  });
+
+  it("inherits only the latest custom summary after repeated compactions", () => {
+    const sessionManager = SessionManager.inMemory();
+    for (let index = 0; index < 28; index++) {
+      sessionManager.appendMessage({ role: "user", content: `obsolete-${index}`, timestamp: index });
+      const retained = sessionManager.appendMessage({ role: "user", content: `kept-${index}`, timestamp: index });
+      sessionManager.appendCompaction(
+        `summary-${index}\n## Reflections\nreflection-${index}\n## Observations\nobservation-${index}`,
+        retained,
+        1000,
+        { source: "custom-compactor" },
+        true,
+      );
+    }
+    sessionManager.appendMessage({ role: "user", content: "latest request", timestamp: 28 });
+    const before = JSON.stringify(sessionManager.getEntries());
+    const out = buildParentContext({ sessionManager } as ExtensionContext);
+    expect(out.match(/\[Summary\]:/g)).toHaveLength(1);
+    expect(out).toContain("summary-27\n## Reflections\nreflection-27\n## Observations\nobservation-27");
+    expect(out).toContain("[User]: kept-27\n\n[User]: latest request");
+    expect(out).not.toContain("obsolete-");
+    for (let index = 0; index < 27; index++) {
+      expect(out).not.toContain(`summary-${index}\n`);
+      expect(out).not.toContain(`kept-${index}\n`);
+    }
+    expect(JSON.stringify(sessionManager.getEntries())).toBe(before);
+  });
+
+  it("supports compact-all summaries with no retained pre-compaction messages", () => {
+    const sessionManager = SessionManager.inMemory();
+    sessionManager.appendMessage({ role: "user", content: "discarded history", timestamp: 0 });
+    sessionManager.appendCompaction("complete summary", "", 1000);
+    sessionManager.appendMessage({ role: "user", content: "new request", timestamp: 1 });
+    const out = buildParentContext({ sessionManager } as ExtensionContext);
+    expect(out).not.toContain("discarded history");
+    expect(out).toContain("[Summary]: complete summary\n\n[User]: new request");
+  });
+
+  it("inherits the selected branch and its summary without abandoned messages", () => {
+    const sessionManager = SessionManager.inMemory();
+    const root = sessionManager.appendMessage({ role: "user", content: "root request", timestamp: 0 });
+    sessionManager.appendMessage({ role: "user", content: "abandoned message", timestamp: 1 });
+    sessionManager.branchWithSummary(root, "branch decisions");
+    sessionManager.appendMessage({ role: "user", content: "selected request", timestamp: 2 });
+    const out = buildParentContext({ sessionManager } as ExtensionContext);
+    expect(out).not.toContain("abandoned message");
+    expect(out).toContain("[User]: root request\n\n[Summary]: branch decisions\n\n[User]: selected request");
+    sessionManager.resetLeaf();
+    expect(buildParentContext({ sessionManager } as ExtensionContext)).toBe("");
   });
 
   it("skips tool_result messages — they're too verbose for inherited context", () => {
