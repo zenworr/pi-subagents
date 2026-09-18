@@ -26,7 +26,7 @@ https://github.com/user-attachments/assets/8685261b-9338-4fea-8dfe-1c590d5df543
 - **Graceful turn limits** — agents get a "wrap up" warning before hard abort, producing clean partial results instead of cut-off output
 - **Case-insensitive agent types** — `"explore"`, `"Explore"`, `"EXPLORE"` all work. A type that doesn't resolve to exactly one *enabled* agent — unknown, disabled, or ambiguous between two agents differing only by case — falls back to general-purpose with a note, or is refused outright under [`fallbackSubagent: none`](#persistent-settings)
 - **Fuzzy model selection** — specify models by name (`"haiku"`, `"sonnet"`) instead of full IDs, with automatic filtering to only available/configured models
-- **Context inheritance** — optionally fork the parent conversation into a sub-agent so it knows what's been discussed
+- **Context inheritance** — optionally pass the active parent conversation to a sub-agent: the current compaction summary, retained messages, and branch summaries. Summarized messages and superseded summaries are not repeated. Custom compactor summaries are preserved.
 - **Persistent agent memory** — three scopes (project, local, user) with automatic read-only fallback for agents without write tools
 - **Git worktree isolation** — run agents in isolated repo copies; changes auto-committed to branches on completion
 - **Skill preloading** — inject named skills into agent system prompts, discovered from `.pi/skills/`, `.agents/skills/`, and global locations (Pi-standard `<name>/SKILL.md` directory layout supported)
@@ -317,7 +317,7 @@ All fields are optional — sensible defaults for everything.
 | `session_dir` | pi default | Optional session directory when `persist_session: true`; omitted uses pi's normal session location, and relative paths resolve from the agent cwd. A session outside the parent's session directory (this override, or `isolation: worktree`) is listed separately, so it shows as a root instead of nesting |
 | `allowed_subagents` | none | Opt in to scoped nested `Agent`, `get_subagent_result`, and `steer_subagent` tools. Omitted / empty / `none` / `false` = no nesting; `all` (or `"*"` / `true`) = any enabled agent; comma-separated list = only those agent types |
 | `prompt_mode` | `replace` | `replace`: body is the full system prompt (no AGENTS.md / CLAUDE.md inheritance). `append`: body appended to parent's prompt (agent acts as a "parent twin" — inherits parent's AGENTS.md / CLAUDE.md) |
-| `inherit_context` | `false` | Fork parent conversation into agent |
+| `inherit_context` | `false` | Pass the active parent conversation as text, with compaction applied |
 | `run_in_background` | — | Pin this agent to background (`true`) or foreground (`false`). Omit to follow `backgroundByDefault` |
 | `isolated` | `false` | Hermetic specialist mode: forces `extensions: false` + `skills: false` + drops `ext:` selectors. Only built-in tools. Distinct from `isolation: worktree` (filesystem) |
 | `enabled` | `true` | Set to `false` to disable an agent (useful for hiding a default agent per-project) |
@@ -416,7 +416,7 @@ Launch a sub-agent.
 | `resume` | string | no | Agent ID or handle to resume a previous session, including a persisted session whose in-memory record was evicted |
 | `isolated` | boolean | no | No extension/MCP tools |
 | `isolation` | `"off"` \| `"worktree"` | no | `worktree` runs in an isolated git worktree; `off` (the default) does not. Absent from the schema entirely when `worktreeIsolation: false` |
-| `inherit_context` | boolean | no | Fork parent conversation into agent |
+| `inherit_context` | boolean | no | Pass the active parent conversation as text, with compaction applied |
 
 ### `SubagentWorkflow`
 
