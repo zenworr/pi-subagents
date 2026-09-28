@@ -180,6 +180,7 @@ export async function runMentionClone(opts: MentionCloneOptions): Promise<Mentio
     );
     session = created.session;
 
+
     // User text first, reminder after — the order Claude Code's attachment
     // renderer produces, where the reminder trails the message it is about.
     await session.prompt(`${message}\n\n${agentMentionReminder(type)}`);
