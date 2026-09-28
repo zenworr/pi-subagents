@@ -170,12 +170,28 @@ export async function runMentionClone(opts: MentionCloneOptions): Promise<Mentio
     );
     session = created.session;
 
-    // The clone rebuilds a system prompt from cwd and agentDir, which is close
-    // but not the live one — extensions contribute to it per turn. Copy the
-    // real thing, so the copy reasons under the instructions the user's model
-    // is actually working under.
+    // The clone rebuilds a prompt without the parent's per-turn extensions.
+    // Older Pi keeps it as a mutable field. Newer Pi derives it from system
+    // messages, so replace that projection at request time and keep the
+    // clone's tool declarations without duplicating prompt sections.
     const systemPrompt = ctx.getSystemPrompt?.();
-    if (systemPrompt) session.agent.state.systemPrompt = systemPrompt;
+    if (systemPrompt) {
+      const state = session.agent.state as { systemPrompt: string };
+      if (Object.getOwnPropertyDescriptor(state, "systemPrompt")?.get) {
+        const transform = session.agent.transformContext;
+        session.agent.transformContext = async (messages, signal) => {
+          const projected = transform ? await transform(messages, signal) : messages;
+          const head = projected.find((entry) => (entry as { role: string }).role === "system");
+          if (!head) throw new Error("clone has no system prompt to replace");
+          return [
+            { ...head, content: systemPrompt, sections: undefined } as unknown as typeof head,
+            ...projected.filter((entry) => (entry as { role: string }).role !== "system"),
+          ];
+        };
+      } else {
+        state.systemPrompt = systemPrompt;
+      }
+    }
 
     // The conversation itself. Pushed rather than assigned so the array the
     // session was built around stays the one it goes on using.
