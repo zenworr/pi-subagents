@@ -37,7 +37,7 @@ import { createOutputFilePath, ensureOutputFile, getOutputTranscriptDefault, ses
 import { getPackageAgentsGate, getPackageWorkflowsGate, invalidatePackageCache, packageNameForPath, seedProjectTrust, setPackageAgentsGate, setPackageWorkflowsGate, setProjectTrusted } from "./package-resources.js";
 import { SubagentScheduler } from "./schedule.js";
 import { resolveStorePath, ScheduleStore } from "./schedule-store.js";
-import { applyAndEmitLoaded, loadSettings, type SubagentsSettings, saveAndEmitChanged, type ToolDescriptionMode } from "./settings.js";
+import { applyAndEmitLoaded, type CompletionDeliveryMode, loadSettings, type SubagentsSettings, saveAndEmitChanged, type ToolDescriptionMode } from "./settings.js";
 import { getForegroundOutcomeNote, getStatusNote, partialOutputSuffix } from "./status-note.js";
 import { type AgentConfig, type AgentInvocation, type AgentMentionMode, type AgentRecord, type AgentTombstone, type JoinMode, type NotificationDetails, type SubagentType, type ViewerMarkdownMode, type WidgetMode } from "./types.js";
 import { createMentionProvider, mentionRoster, type TypeInfo } from "./ui/agent-mention.js";
@@ -460,6 +460,8 @@ export default function (pi: ExtensionAPI) {
     persistSettings(ctx, `Viewer markdown set to ${mode}`);
   }
   const pendingUsage = new PendingUsagePool();
+  let completionDeliveryMode: CompletionDeliveryMode = "steer";
+  function setCompletionDeliveryMode(mode: CompletionDeliveryMode): void { completionDeliveryMode = mode; }
 
   // ---- Completion delivery ----
   // Every completion notification goes through the outbox, which sends what is
@@ -472,7 +474,7 @@ export default function (pi: ExtensionAPI) {
       content: message.content,
       display: true,
       details: message.details,
-    }, { deliverAs: "steer", triggerTurn: true }),
+    }, { deliverAs: completionDeliveryMode, triggerTurn: true }),
     () => currentCtx?.signal !== undefined,
   );
   // A queued result wait must observe completion before its held notification
@@ -1530,6 +1532,7 @@ export default function (pi: ExtensionAPI) {
       setDefaultMaxTurns,
       setGraceTurns,
       setDefaultJoinMode,
+      setCompletionDeliveryMode,
       setBackgroundByDefault,
       setSchedulingEnabled,
       setScopeModels: setScopeModelsEnabled,
@@ -3730,6 +3733,7 @@ Write the file using the write tool. Only write the file, nothing else.`;
       defaultMaxTurns: getDefaultMaxTurns() ?? 0,
       graceTurns: getGraceTurns(),
       defaultJoinMode: getDefaultJoinMode(),
+      completionDeliveryMode,
       backgroundByDefault: getBackgroundByDefault(),
       schedulingEnabled: isSchedulingEnabled(),
       scopeModels: isScopeModelsEnabled(),
@@ -3862,6 +3866,13 @@ Write the file using the write tool. Only write the file, nothing else.`;
           // `async` is an older name for `smart`; settings files may still hold it.
           currentValue: getDefaultJoinMode() === "group" ? "group" : "smart",
           values: ["smart", "group"],
+        },
+        {
+          id: "completionDeliveryMode",
+          label: "Completion delivery",
+          description: "Steer before the next model call or follow up after the parent run ends",
+          currentValue: completionDeliveryMode,
+          values: ["steer", "followUp"],
         },
         {
           id: "backgroundByDefault",
@@ -4066,6 +4077,9 @@ Write the file using the write tool. Only write the file, nothing else.`;
       } else if (id === "joinMode") {
         setDefaultJoinMode(value as JoinMode);
         notifyApplied(ctx, `Default join mode set to ${value}`);
+      } else if (id === "completionDeliveryMode") {
+        setCompletionDeliveryMode(value as CompletionDeliveryMode);
+        notifyApplied(ctx, `Completion delivery set to ${value}`);
       } else if (id === "backgroundByDefault") {
         const enabled = value === "on";
         setBackgroundByDefault(enabled);
