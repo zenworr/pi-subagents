@@ -95,6 +95,17 @@ describe("settings persistence", () => {
     expect(loadSettings(projectDir)).toEqual(settings);
   });
 
+  it("validates completion delivery and lets project settings override global", () => {
+    writeGlobal({ completionDeliveryMode: "followUp" });
+    expect(loadSettings(projectDir)).toEqual({ completionDeliveryMode: "followUp" });
+    saveSettings({ completionDeliveryMode: "steer" }, projectDir);
+    expect(loadSettings(projectDir)).toEqual({ completionDeliveryMode: "steer" });
+    writeProject({ completionDeliveryMode: "immediate" });
+    expect(loadSettings(projectDir)).toEqual({ completionDeliveryMode: "followUp" });
+    writeGlobal({ completionDeliveryMode: 1 });
+    expect(loadSettings(projectDir)).toEqual({});
+  });
+
   it("round-trips schedulingEnabled (true and false), and absence stays absent", () => {
     saveSettings({ schedulingEnabled: false }, projectDir);
     expect(loadSettings(projectDir)).toEqual({ schedulingEnabled: false });
@@ -537,6 +548,7 @@ describe("settings persistence", () => {
         setDefaultMaxTurns: vi.fn(),
         setGraceTurns: vi.fn(),
         setDefaultJoinMode: vi.fn(),
+        setCompletionDeliveryMode: vi.fn(),
         setBackgroundByDefault: vi.fn(),
         setSchedulingEnabled: vi.fn(),
         setScopeModels: vi.fn(),
@@ -569,6 +581,14 @@ describe("settings persistence", () => {
       vi.mocked(appliers.setMaxConcurrentForeground).mockClear();
       applySettings({}, appliers);
       expect(appliers.setMaxConcurrentForeground).not.toHaveBeenCalled();
+    });
+
+    it("applies the selected completion delivery mode only when configured", () => {
+      applySettings({ completionDeliveryMode: "followUp" }, appliers);
+      expect(appliers.setCompletionDeliveryMode).toHaveBeenCalledWith("followUp");
+      vi.mocked(appliers.setCompletionDeliveryMode).mockClear();
+      applySettings({}, appliers);
+      expect(appliers.setCompletionDeliveryMode).not.toHaveBeenCalled();
     });
 
     it("applies reportUsage and showCost", () => {
@@ -788,6 +808,7 @@ describe("settings persistence", () => {
         setDefaultMaxTurns: vi.fn(),
         setGraceTurns: vi.fn(),
         setDefaultJoinMode: vi.fn(),
+        setCompletionDeliveryMode: vi.fn(),
         setBackgroundByDefault: vi.fn(),
         setSchedulingEnabled: vi.fn(),
         setScopeModels: vi.fn(),
