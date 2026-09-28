@@ -34,7 +34,7 @@ import { getMaxSubagentDepth, setMaxSubagentDepth } from "./nested-tools.js";
 import { createOutputFilePath, ensureOutputFile, getOutputTranscriptDefault, sessionTaskDir, setOutputTranscriptDefault, streamToOutputFile, writeInitialEntry } from "./output-file.js";
 import { SubagentScheduler } from "./schedule.js";
 import { resolveStorePath, ScheduleStore } from "./schedule-store.js";
-import { applyAndEmitLoaded, loadSettings, type SubagentsSettings, saveAndEmitChanged, type ToolDescriptionMode } from "./settings.js";
+import { applyAndEmitLoaded, type CompletionDeliveryMode, loadSettings, type SubagentsSettings, saveAndEmitChanged, type ToolDescriptionMode } from "./settings.js";
 import { getForegroundOutcomeNote, getStatusNote, partialOutputSuffix } from "./status-note.js";
 import { type AgentConfig, type AgentInvocation, type AgentMentionMode, type AgentRecord, type AgentTombstone, type JoinMode, type NotificationDetails, type SubagentType, type ViewerMarkdownMode, type WidgetMode } from "./types.js";
 import { createMentionProvider, mentionRoster, type TypeInfo } from "./ui/agent-mention.js";
@@ -443,6 +443,8 @@ export default function (pi: ExtensionAPI) {
     persistSettings(ctx, `Viewer markdown set to ${mode}`);
   }
   const pendingUsage = new PendingUsagePool();
+  let completionDeliveryMode: CompletionDeliveryMode = "steer";
+  function setCompletionDeliveryMode(mode: CompletionDeliveryMode): void { completionDeliveryMode = mode; }
 
   // ---- Cancellable pending notifications ----
   // Holds notifications briefly so get_subagent_result can cancel them
@@ -481,7 +483,7 @@ export default function (pi: ExtensionAPI) {
       content: notification + footer,
       display: true,
       details: buildNotificationDetails(record, 500, agentActivity.get(record.id)),
-    }, { deliverAs: "followUp", triggerTurn: true });
+    }, { deliverAs: completionDeliveryMode, triggerTurn: true });
   }
 
   function sendIndividualNudge(record: AgentRecord) {
@@ -519,7 +521,7 @@ export default function (pi: ExtensionAPI) {
           content: `Background agent group completed: ${label}\n\n${notifications}\n\nUse get_subagent_result for full output.`,
           display: true,
           details,
-        }, { deliverAs: "followUp", triggerTurn: true });
+        }, { deliverAs: completionDeliveryMode, triggerTurn: true });
       });
       widget.update();
     },
@@ -1426,6 +1428,7 @@ export default function (pi: ExtensionAPI) {
       setDefaultMaxTurns,
       setGraceTurns,
       setDefaultJoinMode,
+      setCompletionDeliveryMode,
       setBackgroundByDefault,
       setSchedulingEnabled,
       setScopeModels: setScopeModelsEnabled,
@@ -2491,8 +2494,8 @@ Terse command-style prompts produce shallow, generic work.
 
   /**
    * Hand a finished run back to the model through the SAME channel a background
-   * agent uses — held briefly by `scheduleNudge`, delivered as a follow-up that
-   * triggers a turn, rendered by the existing `subagent-notification` renderer.
+   * agent uses — held briefly by `scheduleNudge`, then delivered to the parent
+   * and rendered by the existing `subagent-notification` renderer.
    */
   function notifyWorkflowFinished(task: WorkflowTask) {
     widget.update();
@@ -2515,7 +2518,7 @@ Terse command-style prompts produce shallow, generic work.
           error: task.error,
           resultPreview: result.length > 500 ? `${result.slice(0, 500)}…` : result,
         },
-      }, { deliverAs: "followUp", triggerTurn: true });
+      }, { deliverAs: completionDeliveryMode, triggerTurn: true });
     });
   }
 
@@ -3562,6 +3565,7 @@ Write the file using the write tool. Only write the file, nothing else.`;
       defaultMaxTurns: getDefaultMaxTurns() ?? 0,
       graceTurns: getGraceTurns(),
       defaultJoinMode: getDefaultJoinMode(),
+      completionDeliveryMode,
       backgroundByDefault: getBackgroundByDefault(),
       schedulingEnabled: isSchedulingEnabled(),
       scopeModels: isScopeModelsEnabled(),
@@ -3667,6 +3671,13 @@ Write the file using the write tool. Only write the file, nothing else.`;
           description: "Default join mode for background agents",
           currentValue: getDefaultJoinMode(),
           values: ["smart", "async", "group"],
+        },
+        {
+          id: "completionDeliveryMode",
+          label: "Completion delivery",
+          description: "Steer before the next model call or follow up after the parent run ends",
+          currentValue: completionDeliveryMode,
+          values: ["steer", "followUp"],
         },
         {
           id: "backgroundByDefault",
@@ -3849,6 +3860,9 @@ Write the file using the write tool. Only write the file, nothing else.`;
       } else if (id === "joinMode") {
         setDefaultJoinMode(value as JoinMode);
         notifyApplied(ctx, `Default join mode set to ${value}`);
+      } else if (id === "completionDeliveryMode") {
+        setCompletionDeliveryMode(value as CompletionDeliveryMode);
+        notifyApplied(ctx, `Completion delivery set to ${value}`);
       } else if (id === "backgroundByDefault") {
         const enabled = value === "on";
         setBackgroundByDefault(enabled);

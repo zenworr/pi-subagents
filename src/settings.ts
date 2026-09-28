@@ -40,6 +40,8 @@ export interface SubagentsSettings {
   defaultMaxTurns?: number;
   graceTurns?: number;
   defaultJoinMode?: JoinMode;
+  /** Deliver background completion messages before the next model call, or after the parent run. */
+  completionDeliveryMode?: CompletionDeliveryMode;
   /**
    * Whether a top-level `Agent` spawn that doesn't say runs detached.
    * Defaults to `true`, following Claude Code, where the agent backgrounds
@@ -305,6 +307,7 @@ export interface SubagentsSettings {
 }
 
 export type ToolDescriptionMode = "full" | "compact" | "custom";
+export type CompletionDeliveryMode = "steer" | "followUp";
 
 /** Setter hooks used by applySettings to wire persisted values into in-memory state. */
 export interface SettingsAppliers {
@@ -313,6 +316,7 @@ export interface SettingsAppliers {
   setDefaultMaxTurns: (n: number) => void;
   setGraceTurns: (n: number) => void;
   setDefaultJoinMode: (mode: JoinMode) => void;
+  setCompletionDeliveryMode: (mode: CompletionDeliveryMode) => void;
   setBackgroundByDefault: (b: boolean) => void;
   setSchedulingEnabled: (b: boolean) => void;
   setScopeModels: (enabled: boolean) => void;
@@ -338,6 +342,7 @@ export interface SettingsAppliers {
 export type SettingsEmit = (event: string, payload: unknown) => void;
 
 const VALID_JOIN_MODES: ReadonlySet<string> = new Set<JoinMode>(["async", "group", "smart"]);
+const VALID_COMPLETION_DELIVERY_MODES: ReadonlySet<string> = new Set<CompletionDeliveryMode>(["steer", "followUp"]);
 const VALID_TOOL_DESCRIPTION_MODES: ReadonlySet<string> = new Set<ToolDescriptionMode>(["full", "compact", "custom"]);
 const VALID_WIDGET_MODES: ReadonlySet<string> = new Set<WidgetMode>(["all", "background", "off"]);
 const VALID_VIEWER_MARKDOWN_MODES: ReadonlySet<string> = new Set<ViewerMarkdownMode>(["off", "assistant", "all"]);
@@ -395,6 +400,9 @@ function sanitize(raw: unknown): SubagentsSettings {
   }
   if (typeof r.defaultJoinMode === "string" && VALID_JOIN_MODES.has(r.defaultJoinMode)) {
     out.defaultJoinMode = r.defaultJoinMode as JoinMode;
+  }
+  if (typeof r.completionDeliveryMode === "string" && VALID_COMPLETION_DELIVERY_MODES.has(r.completionDeliveryMode)) {
+    out.completionDeliveryMode = r.completionDeliveryMode as CompletionDeliveryMode;
   }
   if (typeof r.backgroundByDefault === "boolean") {
     out.backgroundByDefault = r.backgroundByDefault;
@@ -520,6 +528,7 @@ export function applySettings(s: SubagentsSettings, appliers: SettingsAppliers):
   if (typeof s.maxSubagentDepth === "number") appliers.setMaxSubagentDepth(s.maxSubagentDepth);
   if (typeof s.fallbackSubagent === "string") appliers.setFallbackSubagent(s.fallbackSubagent);
   if (s.defaultJoinMode) appliers.setDefaultJoinMode(s.defaultJoinMode);
+  if (s.completionDeliveryMode) appliers.setCompletionDeliveryMode(s.completionDeliveryMode);
   if (typeof s.backgroundByDefault === "boolean") appliers.setBackgroundByDefault(s.backgroundByDefault);
   if (typeof s.schedulingEnabled === "boolean") appliers.setSchedulingEnabled(s.schedulingEnabled);
   if (typeof s.scopeModels === "boolean") appliers.setScopeModels(s.scopeModels);
