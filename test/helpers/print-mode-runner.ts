@@ -328,8 +328,26 @@ export async function runPrintMode(options: RunPrintModeOptions): Promise<PrintM
         throw new Error("runPrintMode (faux mode): provide `respond` or `steps`");
       }
       const max = options.maxModelCalls ?? 16;
-      const factory: FauxResponseStep = async (context, _opts, state) =>
-        toAssistantMessage(await respond(context, state));
+      const factory: FauxResponseStep = async (context, _opts, state) => {
+        // Pi 0.87 moved tool declarations into transcript system messages.
+        // Keep the faux responder's legacy Context shape across the CI range.
+        const head = context.messages.find((message) => (message as { role: string }).role === "system") as
+          | { toolsAdded?: Context["tools"] }
+          | undefined;
+        const system = context.messages.filter((message) => (message as { role: string }).role === "system") as
+          Array<{ content?: string; sections?: Record<string, string | null> }>;
+        const prompt = system.flatMap((message) => [
+          message.content ?? "",
+          ...Object.values(message.sections ?? {}).filter((section): section is string => section !== null),
+        ]).join("\n");
+        const legacy = {
+          ...context,
+          systemPrompt: context.systemPrompt || prompt,
+          tools: context.tools?.length ? context.tools : (head?.toolsAdded ?? context.tools),
+          messages: context.messages.filter((message) => (message as { role: string }).role !== "system"),
+        } as Context;
+        return toAssistantMessage(await respond(legacy, state));
+      };
       faux.setResponses(Array.from({ length: max }, () => factory));
     }
   }

@@ -206,6 +206,26 @@ describe("cloning the conversation", () => {
     expect(session.agent.state.systemPrompt).toBe("the live system prompt");
   });
 
+  it("preserves the live prompt with read-only transcript-based Pi", async () => {
+    const session = cloneSession(callsAgent());
+    Object.defineProperty(session.agent.state, "systemPrompt", { get: () => "rebuilt-from-cwd" });
+    const toolsAdded = [{ name: "Agent" }];
+    session.agent.transformContext = vi.fn(async (messages: any[]) => [
+      { role: "system", content: "rebuilt-from-cwd", sections: { main: "duplicate instructions" }, toolsAdded },
+      ...messages,
+      { role: "system", content: "stale extension change" },
+    ]);
+
+    const result = await runMentionClone(opts());
+
+    expect(result).toEqual({ spawned: true });
+    const request = await session.agent.transformContext([{ role: "user", content: "go" }]);
+    expect(request).toEqual([
+      { role: "system", content: "the live system prompt", sections: undefined, toolsAdded },
+      { role: "user", content: "go" },
+    ]);
+  });
+
   it("inherits the parent's model, thinking level and providers", async () => {
     cloneSession(callsAgent());
 
