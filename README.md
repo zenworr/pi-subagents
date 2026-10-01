@@ -50,7 +50,7 @@ Or load directly for development:
 pi -e ./src/index.ts
 ```
 
-Requires pi **1.1.0 or newer**: pi 0.86 and 0.87 moved the system prompt and conversation history into the session transcript, and the `@handle` conversation clone and the agent transcript files are built on that model. The `peerDependencies` range declares it, so npm flags an older pi at install time.
+Requires pi **1.1.0 or newer**: pi 0.86 and 0.87 moved the system prompt and conversation history into the session transcript, and the `@handle` conversation clone and the agent transcript files are built on that model. Host-provided Pi and TypeBox packages use wildcard peer dependencies to share Pi's runtime modules. CI checks the minimum supported Pi version.
 
 ### Other hosts
 
