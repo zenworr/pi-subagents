@@ -380,6 +380,25 @@ describe("agent-runner final output capture", () => {
     }));
   });
 
+  it("inherits the parent session's thinking level when nothing else sets one (#305)", async () => {
+    const { session } = createSession("OK");
+    createAgentSession.mockResolvedValue({ session });
+
+    await runAgent({ ...ctx, thinkingLevel: "low" }, "Explore", "go", { pi });
+
+    expect(createAgentSession.mock.calls[0][0].thinkingLevel).toBe("low");
+  });
+
+  it("prefers the agent file's thinking level over the parent session's", async () => {
+    vi.mocked(getAgentConfig).mockReturnValueOnce(makeAgentConfig({ thinking: "high" }));
+    const { session } = createSession("OK");
+    createAgentSession.mockResolvedValue({ session });
+
+    await runAgent({ ...ctx, thinkingLevel: "low" }, "Explore", "go", { pi });
+
+    expect(createAgentSession.mock.calls[0][0].thinkingLevel).toBe("high");
+  });
+
   it("omits modelRuntime when the legacy registry does not expose one", async () => {
     const { session } = createSession("LEGACY");
     createAgentSession.mockResolvedValue({ session });
