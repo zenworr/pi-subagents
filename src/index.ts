@@ -1144,6 +1144,12 @@ export default function (pi: ExtensionAPI) {
     // pi awaits this handler, and the process exits right after — unawaited, those
     // handlers would never run. Internally bounded, so a hung one can't strand quit.
     await manager.dispose(pi);
+    // Last, so that runs which settle during the dispose above cannot restart
+    // their timers in this dead session.
+    groupJoin.dispose();
+    if (batchFinalizeTimer) clearTimeout(batchFinalizeTimer);
+    batchFinalizeTimer = undefined;
+    widget.dispose();
   });
 
   // Live widget: show running agents above editor.
