@@ -6,7 +6,7 @@
  */
 
 import { type AgentSession, getMarkdownTheme } from "@earendil-works/pi-coding-agent";
-import { type Component, Input, Markdown, type MarkdownOptions, type MarkdownTheme, matchesKey, type TUI, truncateToWidth, visibleWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
+import { type Component, Input, Markdown, type MarkdownOptions, type MarkdownTheme, matchesKey, type TUI, type TuiMouseEvent, type TuiMouseEventResult, truncateToWidth, visibleWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
 import { renderAgentName } from "../agent-color.js";
 import { extractText } from "../context.js";
 import type { AgentRecord, ViewerMarkdownMode } from "../types.js";
@@ -141,7 +141,13 @@ export class ConversationViewer implements Component {
   private scrollOffset = 0;
   private autoScroll = true;
   private unsubscribe: (() => void) | undefined;
-  private lastInnerW = 0;
+  /** Content line count from the last render, so scroll input does not rebuild the transcript. */
+  private totalLines = 0;
+  /**
+   * Rendered lines per finished message. Finished messages do not change, so
+   * each one is wrapped once per width and mode instead of on every frame.
+   */
+  private lineCache = new WeakMap<object, { width: number; mode: ViewerMarkdownMode; content: unknown; lines: string[] | null }>();
   private closed = false;
   /** Two-press confirm guard for the stop key, so a stray key can't kill the agent. */
   private stopArmed = false;
@@ -156,6 +162,8 @@ export class ConversationViewer implements Component {
    * One `Markdown` per message, so its own text/width cache does the work. A
    * fresh instance per render would re-parse the whole transcript on every
    * keystroke — the component caches, but only across calls to the same object.
+   * Keyed by the message's `content` array: pi sends a streaming reply as a new
+   * shallow copy on every update, and only the array stays the same.
    * Weak so a compacted-away message doesn't pin its render.
    */
   private readonly markdownCache = new WeakMap<object, { md: Markdown; text: string; failed?: boolean }>();
@@ -251,36 +259,33 @@ export class ConversationViewer implements Component {
     }
     if (this.stopArmed) this.stopArmed = false;
 
-    const totalLines = this.buildContentLines(this.lastInnerW).length;
     const viewportHeight = this.viewportHeight();
-    const maxScroll = Math.max(0, totalLines - viewportHeight);
+    if (this.keys.scrollUp(data)) this.scrollBy(-1);
+    else if (this.keys.scrollDown(data)) this.scrollBy(1);
+    else if (this.keys.pageUp(data)) this.scrollBy(-viewportHeight);
+    else if (this.keys.pageDown(data)) this.scrollBy(viewportHeight);
+    else if (matchesKey(data, "home")) this.scrollBy(-Infinity);
+    else if (matchesKey(data, "end")) this.scrollBy(Infinity);
+  }
 
-    if (this.keys.scrollUp(data)) {
-      this.scrollOffset = Math.max(0, this.scrollOffset - 1);
-      this.autoScroll = this.scrollOffset >= maxScroll;
-    } else if (this.keys.scrollDown(data)) {
-      this.scrollOffset = Math.min(maxScroll, this.scrollOffset + 1);
-      this.autoScroll = this.scrollOffset >= maxScroll;
-    } else if (this.keys.pageUp(data)) {
-      this.scrollOffset = Math.max(0, this.scrollOffset - viewportHeight);
-      this.autoScroll = false;
-    } else if (this.keys.pageDown(data)) {
-      this.scrollOffset = Math.min(maxScroll, this.scrollOffset + viewportHeight);
-      this.autoScroll = this.scrollOffset >= maxScroll;
-    } else if (matchesKey(data, "home")) {
-      this.scrollOffset = 0;
-      this.autoScroll = false;
-    } else if (matchesKey(data, "end")) {
-      this.scrollOffset = maxScroll;
-      this.autoScroll = true;
-    }
+  /** Mouse wheel scrolling. Pi sends wheel events to overlays in fullscreen mode only. */
+  handleMouse(event: TuiMouseEvent): TuiMouseEventResult | undefined {
+    if (event.type !== "wheel" || !event.wheelDelta) return undefined;
+    this.scrollBy(event.wheelDelta);
+    return { handled: true };
+  }
+
+  /** The view follows new output only while it is at the bottom. */
+  private scrollBy(delta: number): void {
+    const maxScroll = Math.max(0, this.totalLines - this.viewportHeight());
+    this.scrollOffset = Math.max(0, Math.min(maxScroll, this.scrollOffset + delta));
+    this.autoScroll = this.scrollOffset >= maxScroll;
   }
 
   render(width: number): string[] {
     if (width < 6) return []; // too narrow for any meaningful rendering
     const th = this.theme;
     const innerW = width - 4; // border + padding
-    this.lastInnerW = innerW;
     const lines: string[] = [];
 
     const pad = (s: string, len: number) => {
@@ -327,16 +332,15 @@ export class ConversationViewer implements Component {
     if (invocationLine) lines.push(row(invocationLine));
     lines.push(hrMid);
 
-    // Content area — rebuild every render (live data, no cache needed)
     const contentLines = this.buildContentLines(innerW);
+    this.totalLines = contentLines.length;
     const viewportHeight = this.viewportHeight();
     const maxScroll = Math.max(0, contentLines.length - viewportHeight);
 
-    if (this.autoScroll) {
-      this.scrollOffset = maxScroll;
-    }
-
-    const visibleStart = Math.min(this.scrollOffset, maxScroll);
+    // Content that shrank (a compacted session) can leave the offset past the end.
+    if (this.scrollOffset >= maxScroll) this.autoScroll = true;
+    if (this.autoScroll) this.scrollOffset = maxScroll;
+    const visibleStart = this.scrollOffset;
     const visible = contentLines.slice(visibleStart, visibleStart + viewportHeight);
 
     for (let i = 0; i < viewportHeight; i++) {
@@ -404,8 +408,8 @@ export class ConversationViewer implements Component {
   }
 
   /** Render `text` as Markdown, reusing this message's component instance. */
-  private markdownLines(msg: AgentSession["messages"][number], text: string, width: number, dim: boolean): string[] {
-    let entry = this.markdownCache.get(msg);
+  private markdownLines(key: object, text: string, width: number, dim: boolean): string[] {
+    let entry = this.markdownCache.get(key);
     if (!entry) {
       entry = {
         md: new Markdown(
@@ -422,9 +426,9 @@ export class ConversationViewer implements Component {
         ),
         text,
       };
-      this.markdownCache.set(msg, entry);
+      this.markdownCache.set(key, entry);
     } else if (entry.text !== text) {
-      // Streaming: the message object is stable, its text grows. A failed
+      // Streaming: the content array is stable, its text grows. A failed
       // prefix remains unsafe after append-only deltas, so retry only when the
       // content was replaced or truncated.
       const shouldRetry = !text.startsWith(entry.text);
@@ -471,7 +475,9 @@ export class ConversationViewer implements Component {
     this.tui.requestRender();
   }
 
-  invalidate(): void { /* no cached state to clear */ }
+  invalidate(): void {
+    this.lineCache = new WeakMap();
+  }
 
   dispose(): void {
     this.closed = true;
@@ -511,79 +517,99 @@ export class ConversationViewer implements Component {
 
     const th = this.theme;
     const messages = this.session.messages;
-    const lines: string[] = [];
+    // pi keeps the reply that is being written outside `messages` until it ends.
+    const streaming = this.session.agent?.state.streamingMessage;
+    const streamingReply = streaming?.role === "assistant" ? streaming : undefined;
 
-    if (messages.length === 0) {
-      lines.push(th.fg("dim", "(waiting for first message...)"));
-      return lines;
+    if (messages.length === 0 && !streamingReply) {
+      return [th.fg("dim", "(waiting for first message...)")];
     }
 
     const mode = this.markdownMode();
-    let needsSeparator = false;
-    for (const msg of messages) {
-      if (msg.role === "user") {
-        const text = typeof msg.content === "string"
-          ? msg.content
-          : extractText(msg.content);
-        if (!text.trim()) continue;
-        if (needsSeparator) lines.push(th.fg("dim", "───"));
-        lines.push(th.fg("accent", "[User]"));
-        for (const line of wrapTextWithAnsi(text.trim(), width)) {
-          lines.push(line);
-        }
-      } else if (msg.role === "assistant") {
-        const textParts: string[] = [];
-        const toolCalls: string[] = [];
-        for (const c of msg.content) {
-          if (c.type === "text" && c.text) textParts.push(c.text);
-          else if (c.type === "toolCall") {
-            toolCalls.push((c as any).name ?? (c as any).toolName ?? "unknown");
-          }
-        }
-        if (needsSeparator) lines.push(th.fg("dim", "───"));
-        lines.push(th.bold("[Assistant]"));
-        if (textParts.length > 0) {
-          const text = textParts.join("\n").trim();
-          lines.push(...(mode === "off"
-            ? this.rawLines(text, width, false)
-            : this.markdownLines(msg, text, width, false)));
-        }
-        for (const name of toolCalls) {
-          lines.push(truncateToWidth(th.fg("muted", `  [Tool: ${name}]`), width));
-        }
-      } else if (msg.role === "toolResult") {
-        const { text, elided } = capResult(extractText(msg.content).trim());
-        if (!text) continue;
-        if (needsSeparator) lines.push(th.fg("dim", "───"));
-        lines.push(th.fg("dim", "[Result]"));
-        lines.push(...(mode === "all"
-          ? this.markdownLines(msg, text, width, true)
-          : this.rawLines(text, width, true)));
-        if (elided) lines.push(truncateToWidth(th.fg("dim", truncationNote(elided)), width));
-      } else if ((msg as any).role === "bashExecution") {
-        const bash = msg as any;
-        if (needsSeparator) lines.push(th.fg("dim", "───"));
-        lines.push(truncateToWidth(th.fg("muted", `  $ ${bash.command}`), width));
-        if (bash.output?.trim()) {
-          // Same cap as a tool result, never Markdown: command output is the one
-          // thing here that is definitionally not authored as Markdown.
-          const { text, elided } = capResult(bash.output.trim());
-          lines.push(...this.rawLines(text, width, true));
-          if (elided) lines.push(truncateToWidth(th.fg("dim", truncationNote(elided)), width));
-        }
-      } else {
-        continue;
-      }
-      needsSeparator = true;
-    }
+    const lines: string[] = [];
+    const append = (msgLines: string[] | null) => {
+      if (!msgLines) return;
+      if (lines.length > 0) lines.push(th.fg("dim", "───"));
+      for (const line of msgLines) lines.push(line);
+    };
+    for (const msg of messages) append(this.cachedMessageLines(msg, width, mode));
+    if (streamingReply) append(this.messageLines(streamingReply, width, mode));
 
-    // Streaming indicator for running agents
-    if (this.record.status === "running" && this.activity) {
+    // Streaming indicator for running agents. Not while reply text streams in
+    // above: the indicator would only repeat it.
+    const replyHasText = streamingReply?.content.some(c => c.type === "text" && c.text.trim());
+    if (this.record.status === "running" && this.activity && !replyHasText) {
       const act = describeActivity(this.activity.activeTools, this.activity.responseText);
       lines.push("");
       lines.push(truncateToWidth(th.fg("accent", "▍ ") + th.fg("dim", act), width));
     }
 
+    return lines;
+  }
+
+  private cachedMessageLines(msg: AgentSession["messages"][number], width: number, mode: ViewerMarkdownMode): string[] | null {
+    // `content` too: a `message_end` extension handler can replace it in place.
+    const content = (msg as { content?: unknown }).content;
+    const hit = this.lineCache.get(msg);
+    if (hit && hit.width === width && hit.mode === mode && hit.content === content) return hit.lines;
+    const lines = this.messageLines(msg, width, mode);
+    this.lineCache.set(msg, { width, mode, content, lines });
+    return lines;
+  }
+
+  /** One message's lines, or `null` when the message shows nothing. */
+  private messageLines(msg: AgentSession["messages"][number], width: number, mode: ViewerMarkdownMode): string[] | null {
+    const th = this.theme;
+    const lines: string[] = [];
+    if (msg.role === "user") {
+      const text = typeof msg.content === "string"
+        ? msg.content
+        : extractText(msg.content);
+      if (!text.trim()) return null;
+      lines.push(th.fg("accent", "[User]"));
+      for (const line of wrapTextWithAnsi(text.trim(), width)) {
+        lines.push(line);
+      }
+    } else if (msg.role === "assistant") {
+      const textParts: string[] = [];
+      const toolCalls: string[] = [];
+      for (const c of msg.content) {
+        if (c.type === "text" && c.text) textParts.push(c.text);
+        else if (c.type === "toolCall") {
+          toolCalls.push((c as any).name ?? (c as any).toolName ?? "unknown");
+        }
+      }
+      lines.push(th.bold("[Assistant]"));
+      if (textParts.length > 0) {
+        const text = textParts.join("\n").trim();
+        lines.push(...(mode === "off"
+          ? this.rawLines(text, width, false)
+          : this.markdownLines(msg.content, text, width, false)));
+      }
+      for (const name of toolCalls) {
+        lines.push(th.fg("muted", `  [Tool: ${name}]`));
+      }
+    } else if (msg.role === "toolResult") {
+      const { text, elided } = capResult(extractText(msg.content).trim());
+      if (!text) return null;
+      lines.push(th.fg("dim", "[Result]"));
+      lines.push(...(mode === "all"
+        ? this.markdownLines(msg.content, text, width, true)
+        : this.rawLines(text, width, true)));
+      if (elided) lines.push(th.fg("dim", truncationNote(elided)));
+    } else if ((msg as any).role === "bashExecution") {
+      const bash = msg as any;
+      lines.push(th.fg("muted", `  $ ${bash.command}`));
+      if (bash.output?.trim()) {
+        // Same cap as a tool result, never Markdown: command output is the one
+        // thing here that is definitionally not authored as Markdown.
+        const { text, elided } = capResult(bash.output.trim());
+        lines.push(...this.rawLines(text, width, true));
+        if (elided) lines.push(th.fg("dim", truncationNote(elided)));
+      }
+    } else {
+      return null;
+    }
     return lines.map(l => truncateToWidth(l, width));
   }
 }
