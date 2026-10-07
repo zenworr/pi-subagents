@@ -1,4 +1,10 @@
+import { mkdtempSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { defineConfig } from "vitest/config";
+
+// Tests must not read the developer's own agents, settings or MCP servers.
+const home = mkdtempSync(join(tmpdir(), "pi-subagents-test-home-"));
 
 export default defineConfig({
   // The print-mode e2e suite (test/subagents-print-mode-e2e.test.ts) drives REAL
@@ -12,6 +18,7 @@ export default defineConfig({
   // subagent session the extension spawns. dedupe alone is insufficient (it only
   // affects modules Vite resolves; without inline the runtime stays externalized).
   test: {
+    env: { HOME: home, PI_CODING_AGENT_DIR: join(home, ".pi", "agent") },
     server: { deps: { inline: [/@earendil-works\/pi-/] } },
     // Local reporting only — deliberately no `thresholds`, and not wired into
     // CI. src/index.ts is mostly the /agents wizard, which is TUI flow with
