@@ -10,6 +10,7 @@ import type { AgentRecord } from "../src/types.js";
 vi.mock("../src/agent-runner.js", () => ({
   runAgent: vi.fn(),
   resumeAgent: vi.fn(),
+  resolveEffectiveMaxTurns: (_type: string, explicit?: number) => explicit,
 }));
 
 vi.mock("../src/worktree.js", () => ({
