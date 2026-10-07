@@ -390,6 +390,16 @@ describe("ConversationViewer", () => {
     }
 
     const assistant = (text: string) => [{ role: "assistant", content: [{ type: "text", text }] }];
+
+    /** A viewer on a reply that pi is still streaming: it is not in `messages` yet. */
+    function streamingViewerFor(msg: any, mode?: "off" | "assistant" | "all") {
+      const session = { ...mockSession([]), agent: { state: { streamingMessage: msg } } };
+      return new ConversationViewer(
+        mockTui(200, 80), session, mockRecord({ status: "completed" }), undefined,
+        ansiTheme(), vi.fn(), undefined, undefined, undefined, false,
+        mode ? () => mode : undefined,
+      );
+    }
     const result = (text: string) => [{ role: "toolResult", toolUseId: "t1", content: [{ type: "text", text }] }];
 
     it("renders assistant Markdown by default instead of raw source markers", () => {
@@ -549,8 +559,8 @@ describe("ConversationViewer", () => {
     it("falls back to literal wrapping once for an unsafe streaming prefix", () => {
       // render() is on the TUI's critical path, so a parser throw must degrade
       // rather than take the overlay down with it.
-      const messages = result("# heading");
-      const viewer = viewerFor(messages, "all");
+      const messages = assistant("# heading");
+      const viewer = streamingViewerFor(messages[0]);
       markdownThrows = true;
 
       expect(() => viewer.render(80)).not.toThrow();
@@ -575,24 +585,17 @@ describe("ConversationViewer", () => {
       expect(replaced).not.toContain("## safe");
     });
 
-    it("tracks a tool result that keeps growing past the cap", () => {
-      // The live case: the capped prefix never changes, so the parse is reused,
-      // but the character count being held back has to keep moving.
-      const msg = { role: "toolResult", toolUseId: "t", content: [{ type: "text", text: `${"row\n".repeat(4500)}` }] };
-      const viewer = viewerFor([msg]);
-      const elided = () => {
-        const m = strip(((viewer as any).buildContentLines(76) as string[]).join("\n"))
-          .match(/truncated, ([\d.]+)([kM]?) more/);
-        return Number(m?.[1]) * (m?.[2] === "M" ? 1e6 : m?.[2] === "k" ? 1e3 : 1);
-      };
+    it("shows a capped tool result that arrives after a render", () => {
+      const messages: any[] = assistant("first");
+      const viewer = viewerFor(messages);
+      viewer.render(80);
 
-      const before = elided();
-      msg.content[0].text += "row\n".repeat(1000);
-      const after = elided();
+      messages.push({ role: "toolResult", toolUseId: "t", content: [{ type: "text", text: "row\n".repeat(4500) }] });
+      const out = strip(viewer.render(80).join("\n"));
 
-      expect(before).toBeGreaterThan(0);
-      expect(after).toBeGreaterThan(before);
-      expect(markdownConstructions).toBe(0); // default mode: results take the literal path
+      expect(out).toMatch(/truncated, [\d.]+k? more/);
+      // One Markdown, for the assistant message: in the default mode results take the literal path.
+      expect(markdownConstructions).toBe(1);
     });
 
     it("leaves a result under the cap untouched", () => {
@@ -645,7 +648,7 @@ describe("ConversationViewer", () => {
 
     it("re-renders a message whose text is still streaming", () => {
       const messages = assistant("# One");
-      const viewer = viewerFor(messages);
+      const viewer = streamingViewerFor(messages[0]);
       expect(strip(viewer.render(80).join("\n"))).toContain("One");
 
       messages[0].content[0].text = "# Two";
@@ -653,6 +656,31 @@ describe("ConversationViewer", () => {
 
       expect(out).toContain("Two");
       expect(out).not.toContain("One");
+      expect(markdownConstructions).toBe(1);
+    });
+
+    it("re-renders a finished message whose content an extension replaced", () => {
+      const messages = assistant("first version");
+      const viewer = viewerFor(messages, "off");
+      expect(strip(viewer.render(80).join("\n"))).toContain("first version");
+
+      messages[0].content = [{ type: "text", text: "second version" }];
+
+      expect(strip(viewer.render(80).join("\n"))).toContain("second version");
+    });
+
+    it("reuses one Markdown across the shallow copies pi streams a reply as", () => {
+      const content = [{ type: "text", text: "# One" }];
+      const session: any = { ...mockSession([]), agent: { state: { streamingMessage: { role: "assistant", content } } } };
+      const viewer = new ConversationViewer(
+        mockTui(200, 80), session, mockRecord({ status: "completed" }), undefined, ansiTheme(), vi.fn(),
+      );
+      viewer.render(80);
+
+      content[0].text = "# One two";
+      session.agent.state.streamingMessage = { role: "assistant", content };
+
+      expect(strip(viewer.render(80).join("\n"))).toContain("One two");
       expect(markdownConstructions).toBe(1);
     });
 
@@ -757,6 +785,54 @@ describe("ConversationViewer", () => {
         mockTui(30, w), mockSession(messages), mockRecord(), undefined, ansiTheme(), vi.fn(),
       );
       assertAllLinesFit(callBuildContentLines(viewer, w), w);
+    });
+  });
+
+  describe("scrolling", () => {
+    const strip = (text: string) => text.replace(/\x1b\[[0-9;]*m/g, "");
+    const lines = (n: number) => Array.from({ length: n }, (_, i) => ({ role: "user", content: `line ${i}` }));
+
+    it("keeps following new output after PgUp while everything fits", () => {
+      const messages: any[] = lines(1);
+      const viewer = new ConversationViewer(mockTui(40, 80), mockSession(messages), mockRecord(), undefined, ansiTheme(), vi.fn());
+      viewer.render(80);
+      viewer.handleInput("\x1b[5~");
+
+      messages.push(...lines(80));
+      expect(strip(viewer.render(80).join("\n"))).toContain("line 79");
+    });
+
+    it("scrolls with the mouse wheel and follows again at the bottom", () => {
+      const messages: any[] = lines(80);
+      const viewer = new ConversationViewer(mockTui(40, 80), mockSession(messages), mockRecord(), undefined, ansiTheme(), vi.fn());
+      viewer.render(80);
+      const wheel = (wheelDelta: number) => viewer.handleMouse({ type: "wheel", wheelDelta } as any);
+
+      expect(wheel(-5)).toEqual({ handled: true });
+      messages.push({ role: "user", content: "newest" });
+      expect(strip(viewer.render(80).join("\n"))).not.toContain("newest");
+
+      wheel(1000);
+      messages.push({ role: "user", content: "latest" });
+      expect(strip(viewer.render(80).join("\n"))).toContain("latest");
+    });
+
+    it("follows again when shrunk content puts the view at the bottom", () => {
+      const messages: any[] = lines(80);
+      const viewer = new ConversationViewer(mockTui(40, 80), mockSession(messages), mockRecord(), undefined, ansiTheme(), vi.fn());
+      viewer.render(80);
+      viewer.handleMouse({ type: "wheel", wheelDelta: -5 } as any);
+
+      messages.splice(0, messages.length - 1);
+      viewer.render(80);
+      messages.push(...Array.from({ length: 80 }, (_, i) => ({ role: "user", content: `new ${i}` })));
+
+      expect(strip(viewer.render(80).join("\n"))).toContain("new 79");
+    });
+
+    it("ignores mouse events other than the wheel", () => {
+      const viewer = new ConversationViewer(mockTui(), mockSession(lines(3)), mockRecord(), undefined, ansiTheme(), vi.fn());
+      expect(viewer.handleMouse({ type: "click", button: "left" } as any)).toBeUndefined();
     });
   });
 
