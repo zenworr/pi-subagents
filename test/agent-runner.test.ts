@@ -2586,6 +2586,24 @@ describe("agent-runner turn limits", () => {
     expect(result.aborted).toBe(true);
   });
 
+  it("enforces the turn limit on a resumed run too (#368)", async () => {
+    setGraceTurns(2);
+    const { session, listeners } = createSession("OK");
+    session.prompt.mockImplementation(async () => {
+      for (let i = 0; i < 7; i++) {
+        for (const l of [...listeners]) l({ type: "turn_end" });
+      }
+    });
+    const turns: number[] = [];
+
+    const result = await resumeAgent(session as any, "again", { maxTurns: 5, onTurnEnd: (n) => turns.push(n) });
+
+    expect(session.steer).toHaveBeenCalledTimes(1);
+    expect(session.abort).toHaveBeenCalled();
+    expect(result).toMatchObject({ aborted: true, steered: true });
+    expect(turns).toEqual([1, 2, 3, 4, 5, 6, 7]);
+  });
+
   it("keeps running through the grace window without aborting", async () => {
     setGraceTurns(3);
     const { session, result } = await runWithTurns(7, { maxTurns: 5 });
