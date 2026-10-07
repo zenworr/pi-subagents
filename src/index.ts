@@ -113,11 +113,13 @@ function createActivityTracker(maxTurns?: number, onStreamUpdate?: () => void) {
     responseText: "",
     session: undefined,
   };
+  // A counter, not a timestamp: two tools that start in the same millisecond need two keys.
+  let nextToolKey = 0;
 
   const callbacks = {
     onToolActivity: (activity: { type: "start" | "end"; toolName: string }) => {
       if (activity.type === "start") {
-        state.activeTools.set(activity.toolName + "_" + Date.now(), activity.toolName);
+        state.activeTools.set(`${activity.toolName}_${nextToolKey++}`, activity.toolName);
       } else {
         for (const [key, name] of state.activeTools) {
           if (name === activity.toolName) { state.activeTools.delete(key); break; }
@@ -126,9 +128,10 @@ function createActivityTracker(maxTurns?: number, onStreamUpdate?: () => void) {
       }
       onStreamUpdate?.();
     },
+    // No repaint per text delta: the foreground card's spinner timer repaints
+    // it with the latest text, and a repaint per token is a full redraw (#317).
     onTextDelta: (_delta: string, fullText: string) => {
       state.responseText = fullText;
-      onStreamUpdate?.();
     },
     onTurnEnd: (turnCount: number) => {
       state.turnCount = turnCount;
