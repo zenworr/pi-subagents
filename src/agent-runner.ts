@@ -573,19 +573,27 @@ function getLastAssistantText(session: AgentSession, startIndex = 0): string {
 
 /**
  * Error message of THIS invocation's final assistant message, when that turn
- * failed. Two failure shapes, both keyed off how the final turn STOPPED:
+ * failed. Three failure shapes, all keyed off how the final turn STOPPED:
+ *   - stopReason "toolUse" on the very last message: the run ended before the
+ *     tool returned a result (#355).
  *   - stopReason "error": a provider failure pi resolved instead of rejecting
  *     (any text; partial output is surfaced separately).
  *   - stopReason "length" with NO text: a silent max-token death — the run hit
  *     the output-token ceiling before writing anything, which would otherwise
  *     land as a "completed" run with an empty result (the #144 symptom).
- * Everything else completes: a clean "stop"/"toolUse" final, and — crucially — a
+ * Everything else completes: a clean "stop" final, and — crucially — a
  * "length" stop that DID produce text (a legitimate truncated-but-useful answer).
  * "aborted" is handled by the manager's abort flag / "stopped" guard, not here.
  * Bounded by `startIndex` (like the text fallback) so a resume that produced no
  * assistant message of its own never inherits a PRIOR turn's stop reason.
  */
 function finalTurnError(session: AgentSession, startIndex = 0): string | undefined {
+  const last = session.messages.at(-1);
+  // pi appends the tool results before a run ends, so a run that ends on its
+  // own tool call stopped before the tool returned (#355).
+  if (session.messages.length > startIndex && last?.role === "assistant" && last.stopReason === "toolUse") {
+    return "run ended after a tool call, before the tool returned a result";
+  }
   for (let i = session.messages.length - 1; i >= startIndex; i--) {
     const msg = session.messages[i];
     if (msg.role !== "assistant") continue;

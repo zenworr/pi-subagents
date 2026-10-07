@@ -408,6 +408,31 @@ describe("agent-runner failed-final-turn detection (#144)", () => {
     expect(result.failure).toBe("retries exhausted: 529 overloaded");
   });
 
+  it("flags a run that ends on a tool call without its result (#355)", async () => {
+    const session = sessionEnding({
+      role: "assistant",
+      content: [{ type: "toolCall", id: "c1", name: "read", arguments: {} }],
+      stopReason: "toolUse",
+    });
+    createAgentSession.mockResolvedValue({ session });
+
+    const result = await runAgent(ctx, "Explore", "go", { pi });
+
+    expect(result.failure).toBe("run ended after a tool call, before the tool returned a result");
+  });
+
+  it("does not flag a tool call whose result arrived", async () => {
+    const session = sessionEnding(
+      { role: "assistant", content: [{ type: "toolCall", id: "c1", name: "read", arguments: {} }], stopReason: "toolUse" },
+      { role: "toolResult", content: [] },
+    );
+    createAgentSession.mockResolvedValue({ session });
+
+    const result = await runAgent(ctx, "Explore", "go", { pi });
+
+    expect(result.failure).toBeUndefined();
+  });
+
   it("flags the failure even when an EARLIER turn produced text (no masking)", async () => {
     const session = sessionEnding(
       { role: "assistant", content: [{ type: "text", text: "partial progress" }] },
