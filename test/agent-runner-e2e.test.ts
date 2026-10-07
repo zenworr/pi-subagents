@@ -40,6 +40,7 @@ import { registerFauxProvider } from "./helpers/pi-ai.js";
 vi.setConfig({ testTimeout: 30_000 });
 
 const FIXTURE = resolve(fileURLToPath(new URL("./fixtures/e2e-probe-ext.mjs", import.meta.url)));
+const CODEMODE_FIXTURE = resolve(fileURLToPath(new URL("./fixtures/e2e-codemode-ext.mjs", import.meta.url)));
 /** The fixture registers exactly this tool. */
 const EXT_TOOL = "e2e_probe";
 const BUILTINS = ["read", "bash", "edit", "write", "grep", "find", "ls"];
@@ -68,7 +69,7 @@ describe("agent-runner end-to-end (real pi-mono session + real extension)", () =
    * Register `cfg` as agent type "e2e", run it through the REAL runAgent, and
    * return the real session's active tool names captured at construction time.
    */
-  async function activeToolsFor(cfg: Partial<AgentConfig>): Promise<string[]> {
+  async function activeToolsFor(cfg: Partial<AgentConfig>, registered = false): Promise<string[]> {
     registerAgents(
       new Map([
         [
@@ -107,7 +108,7 @@ describe("agent-runner end-to-end (real pi-mono session + real extension)", () =
         pi: makePi(),
         model,
         onSessionCreated: (s) => {
-          active = s.getActiveToolNames();
+          active = registered ? s.getAllTools().map((t) => t.name) : s.getActiveToolNames();
         },
       });
     } catch {
@@ -157,5 +158,23 @@ describe("agent-runner end-to-end (real pi-mono session + real extension)", () =
     expect(active).toContain(EXT_TOOL); // selected → surfaces despite the flip
     expect(active).toContain("read");
     expect(active).not.toContain("bash"); // builtinToolNames: ["read"] only
+  });
+
+  it("loads pi's built-in codemode and tool-search extensions", async () => {
+    const tools = await activeToolsFor({ extensions: true }, true);
+    expect(tools).toContain("codemode");
+    expect(tools).toContain("tool_search");
+  });
+
+  it("does not declare a codemode-only tool to the model", async () => {
+    const all = await activeToolsFor({ extensions: [CODEMODE_FIXTURE] }, true);
+    const active = await activeToolsFor({ extensions: [CODEMODE_FIXTURE] });
+    expect(all).toContain("e2e_codemode_only");
+    expect(active).not.toContain("e2e_codemode_only");
+  });
+
+  it("does not load pi's built-in extensions when extensions are disabled", async () => {
+    const tools = await activeToolsFor({ extensions: false }, true);
+    expect(tools).not.toContain("codemode");
   });
 });

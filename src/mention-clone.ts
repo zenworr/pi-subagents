@@ -66,6 +66,7 @@ import {
   buildSessionContext,
   createAgentSession,
   type ExtensionContext,
+  type ExtensionToolContext,
   SessionManager,
   type ToolDefinition,
 } from "@earendil-works/pi-coding-agent";
@@ -125,7 +126,8 @@ export async function runMentionClone(opts: MentionCloneOptions): Promise<Mentio
         { ...(params as Record<string, unknown>), run_in_background: true } as typeof params,
         signal,
         onUpdate,
-        ctx,
+        // The Agent tool does not call `tools` or `executeTool`.
+        ctx as ExtensionToolContext,
       );
     },
   };

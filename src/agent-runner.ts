@@ -11,6 +11,9 @@ import {
   type AgentSession,
   type AgentSessionEvent,
   createAgentSession,
+  createCodemodeExtension,
+  createMcpExtension,
+  createToolSearchExtension,
   DefaultResourceLoader,
   type ExtensionAPI,
   getAgentDir,
@@ -279,8 +282,16 @@ export function installExtensionToolScope(
 
   const renarrow = () => {
     const allowed = inScope();
-    const next = session.getAllTools().map((t) => t.name).filter((n) => allowed.has(n));
     const current = session.getActiveToolNames();
+    const active = new Set(current);
+    // Activate only what pi itself declares to the model on registration, plus
+    // what is already active (tool_search loads deferred tools that way).
+    // `codemode` and `deferred` tools stay callable from codemode scripts;
+    // declaring them would send the whole MCP catalogue with every request.
+    const next = session.getAllTools()
+      .filter((t) => allowed.has(t.name)
+        && (t.exposure === "direct" || t.exposure === "model-only" || active.has(t.name)))
+      .map((t) => t.name);
     // setActiveToolsByName unconditionally rebuilds the system prompt, so skip
     // the no-op that steady-state turns would otherwise pay for every turn.
     if (next.length !== current.length || next.some((n, i) => n !== current[i])) {
@@ -748,6 +759,13 @@ export async function runAgent(
     cwd: configCwd,
     agentDir,
     noExtensions,
+    // pi's CLI gives these built-ins to the main session only. An SDK-built
+    // loader has none of them unless they are passed here.
+    extensionFactories: [
+      { name: "codemode", factory: createCodemodeExtension(), replaceable: true, builtin: true },
+      { name: "tool-search", factory: createToolSearchExtension(), replaceable: true, builtin: true },
+      { name: "mcp", factory: createMcpExtension(), replaceable: true, builtin: true },
+    ],
     additionalExtensionPaths,
     extensionsOverride,
     noSkills,

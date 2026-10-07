@@ -49,7 +49,7 @@ Or load directly for development:
 pi -e ./src/index.ts
 ```
 
-Requires pi **0.84.0 or newer**: the [`SubagentWorkflow`](#subagentworkflow) tool builds on `constrainedSampling` (pi 0.82.0) and pi-tui's `stripTerminalSequences` (0.84.0). Host-provided Pi and TypeBox packages use wildcard peer dependencies to share Pi's runtime modules. CI checks the minimum supported Pi version.
+Requires pi **1.0.4 or newer**: subagents load pi's built-in codemode, tool-search and MCP extensions through the factories that pi 1.0 exports. Host-provided Pi and TypeBox packages use wildcard peer dependencies to share Pi's runtime modules. CI checks the minimum supported Pi version.
 
 ### Other hosts
 
