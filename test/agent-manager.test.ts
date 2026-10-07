@@ -911,6 +911,28 @@ describe("AgentManager — isolation: worktree fails loud, no silent fallback", 
     expect(record.result).toContain("Changes saved to branch");
   });
 
+  it("tells the caller where the changes are when saving them to a branch failed", async () => {
+    const { createWorktree, cleanupWorktree } = await import("../src/worktree.js");
+    const wt = { path: "/wt/b", branch: "pi-agent-b", baseSha: "abc", workPath: "/wt/b" };
+    vi.mocked(createWorktree).mockResolvedValueOnce(wt as never);
+    vi.mocked(cleanupWorktree).mockReturnValueOnce({ hasChanges: true, path: "/wt/b" } as never);
+    vi.mocked(runAgent).mockResolvedValue({
+      responseText: "I edited two files",
+      session: mockSession(),
+      aborted: false,
+      steered: false,
+    } as never);
+
+    manager = new AgentManager();
+    const id = manager.spawn(mockPi, mockCtx, "X", "go", {
+      description: "go", isBackground: true, isolation: "worktree",
+    });
+    await manager.awaitStartup(id);
+    await vi.waitFor(() => expect(manager.getRecord(id)!.status).toBe("completed"));
+
+    expect(manager.getRecord(id)!.result).toContain("They are still in the worktree `/wt/b`");
+  });
+
   it("a stop that lands during the copy discards the worktree instead of running", async () => {
     // Window that did not exist when creation was synchronous: abort() can mark
     // the record stopped while the repo is still being copied.
