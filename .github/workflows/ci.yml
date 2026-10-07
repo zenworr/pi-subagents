@@ -20,13 +20,8 @@ jobs:
       - run: npm run typecheck
       - run: npm run test
 
-  # The pi devDependencies pin the compile baseline POST-migration (0.84.2), so the `build`
-  # job above is what guards the modelRegistry -> modelRuntime world: PR #152's
-  # isolated-provider test (test/e2e/isolated-provider.e2e.test.ts) skips itself on
-  # pre-migration Pi and now actually runs there.
-  #
   # Wildcard host peers share Pi's runtime modules; CI checks version compatibility.
-  # Pi 0.84.0 is the supported minimum for constrainedSampling and stripTerminalSequences.
+  # Pi 1.0.4 is the supported minimum for the built-in extension factories.
   compat-floor-pi:
     runs-on: ubuntu-latest
     steps:
@@ -37,7 +32,7 @@ jobs:
           cache: npm
       - run: npm ci
       - name: Install floor Pi
-        run: npm install --no-save @earendil-works/pi-coding-agent@0.84.0 @earendil-works/pi-ai@0.84.0 @earendil-works/pi-tui@0.84.0
+        run: npm install --no-save @earendil-works/pi-coding-agent@1.0.4 @earendil-works/pi-ai@1.0.4 @earendil-works/pi-tui@1.0.4
       - name: Typecheck against floor Pi
         run: npm run typecheck
       - name: Test suite against floor Pi
