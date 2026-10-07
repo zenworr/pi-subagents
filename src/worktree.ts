@@ -57,7 +57,7 @@ export interface WorktreeCleanupResult {
   hasChanges: boolean;
   /** Branch name if changes were committed. */
   branch?: string;
-  /** Worktree path if it was kept. */
+  /** Worktree path. Without `branch`, the worktree was kept because saving the changes failed. */
   path?: string;
 }
 
@@ -175,9 +175,8 @@ export async function cleanupWorktree(
       path: worktree.path,
     };
   } catch {
-    // Best effort cleanup on error
-    try { await removeWorktree(pi, cwd, worktree.path); } catch { /* ignore */ }
-    return { hasChanges: false };
+    // The worktree can hold the only copy of the agent's changes, so keep it.
+    return { hasChanges: true, path: worktree.path };
   }
 }
 
