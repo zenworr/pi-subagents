@@ -163,7 +163,14 @@ export class ConversationViewer implements Component, Focusable {
   private newMessages = 0;
   private readonly scrollView: ScrollView;
   private unsubscribe: (() => void) | undefined;
+  /** Content line count from the last render, so scroll input does not rebuild the transcript. */
+  private totalLines = 0;
   private lastInnerW = 0;
+  /**
+   * Rendered lines per finished message. Finished messages do not change, so
+   * each one is wrapped once per width and mode instead of on every frame.
+   */
+  private lineCache = new WeakMap<object, { width: number; mode: ViewerMarkdownMode; content: unknown; lines: string[] | null }>();
   private closed = false;
   /** Two-press confirm guard for the stop key, so a stray key can't kill the agent. */
   private stopArmed = false;
@@ -178,6 +185,8 @@ export class ConversationViewer implements Component, Focusable {
    * One `Markdown` per message, so its own text/width cache does the work. A
    * fresh instance per render would re-parse the whole transcript on every
    * keystroke — the component caches, but only across calls to the same object.
+   * Keyed by the message's `content` array: pi sends a streaming reply as a new
+   * shallow copy on every update, and only the array stays the same.
    * Weak so a compacted-away message doesn't pin its render.
    */
   private readonly markdownCache = new WeakMap<object, { md: Markdown; text: string; failed?: boolean }>();
@@ -304,10 +313,9 @@ export class ConversationViewer implements Component, Focusable {
     }
     if (this.stopArmed) this.stopArmed = false;
 
-    const totalLines = this.buildContentLines(this.lastInnerW).length;
     const viewportHeight = this.viewportHeight();
     if (this.fullscreen) {
-      this.scrollView.updateLayout(totalLines, viewportHeight, () => {
+      this.scrollView.updateLayout(this.totalLines, viewportHeight, () => {
         if (!this.closed) this.tui.requestRender();
       });
       if (this.keys.scrollUp(data)) this.scrollView.scrollBy(-1);
@@ -317,27 +325,19 @@ export class ConversationViewer implements Component, Focusable {
       else if (matchesKey(data, "home")) this.scrollView.scrollToStart();
       return;
     }
-    const maxScroll = Math.max(0, totalLines - viewportHeight);
+    if (this.keys.scrollUp(data)) this.scrollBy(-1);
+    else if (this.keys.scrollDown(data)) this.scrollBy(1);
+    else if (this.keys.pageUp(data)) this.scrollBy(-viewportHeight);
+    else if (this.keys.pageDown(data)) this.scrollBy(viewportHeight);
+    else if (matchesKey(data, "home")) this.scrollBy(-Infinity);
+    else if (matchesKey(data, "end")) this.scrollBy(Infinity);
+  }
 
-    if (this.keys.scrollUp(data)) {
-      this.scrollOffset = Math.max(0, this.scrollOffset - 1);
-      this.autoScroll = this.scrollOffset >= maxScroll;
-    } else if (this.keys.scrollDown(data)) {
-      this.scrollOffset = Math.min(maxScroll, this.scrollOffset + 1);
-      this.autoScroll = this.scrollOffset >= maxScroll;
-    } else if (this.keys.pageUp(data)) {
-      this.scrollOffset = Math.max(0, this.scrollOffset - viewportHeight);
-      this.autoScroll = false;
-    } else if (this.keys.pageDown(data)) {
-      this.scrollOffset = Math.min(maxScroll, this.scrollOffset + viewportHeight);
-      this.autoScroll = this.scrollOffset >= maxScroll;
-    } else if (matchesKey(data, "home")) {
-      this.scrollOffset = 0;
-      this.autoScroll = false;
-    } else if (matchesKey(data, "end")) {
-      this.scrollOffset = maxScroll;
-      this.autoScroll = true;
-    }
+  /** The view follows new output only while it is at the bottom. */
+  private scrollBy(delta: number): void {
+    const maxScroll = Math.max(0, this.totalLines - this.viewportHeight());
+    this.scrollOffset = Math.max(0, Math.min(maxScroll, this.scrollOffset + delta));
+    this.autoScroll = this.scrollOffset >= maxScroll;
   }
 
   private jumpToLatest(): void {
@@ -471,8 +471,8 @@ export class ConversationViewer implements Component, Focusable {
     if (invocationLine) lines.push(row(invocationLine));
     lines.push(hrMid);
 
-    // Content area — rebuild every render (live data, no cache needed)
     const contentLines = this.fullscreen ? this.scrollView.render(width - 1) : this.buildContentLines(innerW);
+    this.totalLines = contentLines.length;
     const viewportHeight = this.viewportHeight();
     const maxScroll = Math.max(0, contentLines.length - viewportHeight);
     if (this.fullscreen) {
@@ -480,8 +480,9 @@ export class ConversationViewer implements Component, Focusable {
         if (!this.closed) this.tui.requestRender();
       });
       if (this.scrollView.isFollowingEnd) this.newMessages = 0;
-    } else if (this.autoScroll) {
-      this.scrollOffset = maxScroll;
+    } else {
+      if (this.scrollOffset >= maxScroll) this.autoScroll = true;
+      if (this.autoScroll) this.scrollOffset = maxScroll;
     }
 
     const visibleStart = this.fullscreen ? this.scrollView.scrollTop : Math.min(this.scrollOffset, maxScroll);
@@ -594,8 +595,8 @@ export class ConversationViewer implements Component, Focusable {
   }
 
   /** Render `text` as Markdown, reusing this message's component instance. */
-  private markdownLines(msg: AgentSession["messages"][number], text: string, width: number, dim: boolean): string[] {
-    let entry = this.markdownCache.get(msg);
+  private markdownLines(key: object, text: string, width: number, dim: boolean): string[] {
+    let entry = this.markdownCache.get(key);
     if (!entry) {
       entry = {
         md: new Markdown(
@@ -612,9 +613,9 @@ export class ConversationViewer implements Component, Focusable {
         ),
         text,
       };
-      this.markdownCache.set(msg, entry);
+      this.markdownCache.set(key, entry);
     } else if (entry.text !== text) {
-      // Streaming: the message object is stable, its text grows. A failed
+      // Streaming: the content array is stable, its text grows. A failed
       // prefix remains unsafe after append-only deltas, so retry only when the
       // content was replaced or truncated.
       const shouldRetry = !text.startsWith(entry.text);
@@ -670,7 +671,9 @@ export class ConversationViewer implements Component, Focusable {
     this.tui.requestRender();
   }
 
-  invalidate(): void { /* no cached state to clear */ }
+  invalidate(): void {
+    this.lineCache = new WeakMap();
+  }
 
   dispose(): void {
     this.closed = true;
@@ -712,79 +715,99 @@ export class ConversationViewer implements Component, Focusable {
 
     const th = this.theme;
     const messages = this.session.messages;
-    const lines: string[] = [];
+    // pi keeps the reply that is being written outside `messages` until it ends.
+    const streaming = this.session.agent?.state.streamingMessage;
+    const streamingReply = streaming?.role === "assistant" ? streaming : undefined;
 
-    if (messages.length === 0) {
-      lines.push(th.fg("dim", "(waiting for first message...)"));
-      return lines;
+    if (messages.length === 0 && !streamingReply) {
+      return [th.fg("dim", "(waiting for first message...)")];
     }
 
     const mode = this.markdownMode();
-    let needsSeparator = false;
-    for (const msg of messages) {
-      if (msg.role === "user") {
-        const text = typeof msg.content === "string"
-          ? msg.content
-          : extractText(msg.content);
-        if (!text.trim()) continue;
-        if (needsSeparator) lines.push(th.fg("dim", "───"));
-        lines.push(th.fg("accent", "[User]"));
-        for (const line of wrapTextWithAnsi(text.trim(), width)) {
-          lines.push(line);
-        }
-      } else if (msg.role === "assistant") {
-        const textParts: string[] = [];
-        const toolCalls: string[] = [];
-        for (const c of msg.content) {
-          if (c.type === "text" && c.text) textParts.push(c.text);
-          else if (c.type === "toolCall") {
-            toolCalls.push((c as any).name ?? (c as any).toolName ?? "unknown");
-          }
-        }
-        if (needsSeparator) lines.push(th.fg("dim", "───"));
-        lines.push(th.bold("[Assistant]"));
-        if (textParts.length > 0) {
-          const text = textParts.join("\n").trim();
-          lines.push(...(mode === "off"
-            ? this.rawLines(text, width, false)
-            : this.markdownLines(msg, text, width, false)));
-        }
-        for (const name of toolCalls) {
-          lines.push(truncateToWidth(th.fg("muted", `  [Tool: ${name}]`), width));
-        }
-      } else if (msg.role === "toolResult") {
-        const { text, elided } = capResult(extractText(msg.content).trim());
-        if (!text) continue;
-        if (needsSeparator) lines.push(th.fg("dim", "───"));
-        lines.push(th.fg("dim", "[Result]"));
-        lines.push(...(mode === "all"
-          ? this.markdownLines(msg, text, width, true)
-          : this.rawLines(text, width, true)));
-        if (elided) lines.push(truncateToWidth(th.fg("dim", truncationNote(elided)), width));
-      } else if ((msg as any).role === "bashExecution") {
-        const bash = msg as any;
-        if (needsSeparator) lines.push(th.fg("dim", "───"));
-        lines.push(truncateToWidth(th.fg("muted", `  $ ${bash.command}`), width));
-        if (bash.output?.trim()) {
-          // Same cap as a tool result, never Markdown: command output is the one
-          // thing here that is definitionally not authored as Markdown.
-          const { text, elided } = capResult(bash.output.trim());
-          lines.push(...this.rawLines(text, width, true));
-          if (elided) lines.push(truncateToWidth(th.fg("dim", truncationNote(elided)), width));
-        }
-      } else {
-        continue;
-      }
-      needsSeparator = true;
-    }
+    const lines: string[] = [];
+    const append = (msgLines: string[] | null) => {
+      if (!msgLines) return;
+      if (lines.length > 0) lines.push(th.fg("dim", "───"));
+      for (const line of msgLines) lines.push(line);
+    };
+    for (const msg of messages) append(this.cachedMessageLines(msg, width, mode));
+    if (streamingReply) append(this.messageLines(streamingReply, width, mode));
 
-    // Streaming indicator for running agents
-    if (this.record.status === "running" && this.activity) {
+    // Streaming indicator for running agents. Not while reply text streams in
+    // above: the indicator would only repeat it.
+    const replyHasText = streamingReply?.content.some(c => c.type === "text" && c.text.trim());
+    if (this.record.status === "running" && this.activity && !replyHasText) {
       const act = describeActivity(this.activity.activeTools, this.activity.responseText);
       lines.push("");
       lines.push(truncateToWidth(th.fg("accent", "▍ ") + th.fg("dim", act), width));
     }
 
+    return lines;
+  }
+
+  private cachedMessageLines(msg: AgentSession["messages"][number], width: number, mode: ViewerMarkdownMode): string[] | null {
+    // `content` too: a `message_end` extension handler can replace it in place.
+    const content = (msg as { content?: unknown }).content;
+    const hit = this.lineCache.get(msg);
+    if (hit && hit.width === width && hit.mode === mode && hit.content === content) return hit.lines;
+    const lines = this.messageLines(msg, width, mode);
+    this.lineCache.set(msg, { width, mode, content, lines });
+    return lines;
+  }
+
+  /** One message's lines, or `null` when the message shows nothing. */
+  private messageLines(msg: AgentSession["messages"][number], width: number, mode: ViewerMarkdownMode): string[] | null {
+    const th = this.theme;
+    const lines: string[] = [];
+    if (msg.role === "user") {
+      const text = typeof msg.content === "string"
+        ? msg.content
+        : extractText(msg.content);
+      if (!text.trim()) return null;
+      lines.push(th.fg("accent", "[User]"));
+      for (const line of wrapTextWithAnsi(text.trim(), width)) {
+        lines.push(line);
+      }
+    } else if (msg.role === "assistant") {
+      const textParts: string[] = [];
+      const toolCalls: string[] = [];
+      for (const c of msg.content) {
+        if (c.type === "text" && c.text) textParts.push(c.text);
+        else if (c.type === "toolCall") {
+          toolCalls.push((c as any).name ?? (c as any).toolName ?? "unknown");
+        }
+      }
+      lines.push(th.bold("[Assistant]"));
+      if (textParts.length > 0) {
+        const text = textParts.join("\n").trim();
+        lines.push(...(mode === "off"
+          ? this.rawLines(text, width, false)
+          : this.markdownLines(msg.content, text, width, false)));
+      }
+      for (const name of toolCalls) {
+        lines.push(th.fg("muted", `  [Tool: ${name}]`));
+      }
+    } else if (msg.role === "toolResult") {
+      const { text, elided } = capResult(extractText(msg.content).trim());
+      if (!text) return null;
+      lines.push(th.fg("dim", "[Result]"));
+      lines.push(...(mode === "all"
+        ? this.markdownLines(msg.content, text, width, true)
+        : this.rawLines(text, width, true)));
+      if (elided) lines.push(th.fg("dim", truncationNote(elided)));
+    } else if ((msg as any).role === "bashExecution") {
+      const bash = msg as any;
+      lines.push(th.fg("muted", `  $ ${bash.command}`));
+      if (bash.output?.trim()) {
+        // Same cap as a tool result, never Markdown: command output is the one
+        // thing here that is definitionally not authored as Markdown.
+        const { text, elided } = capResult(bash.output.trim());
+        lines.push(...this.rawLines(text, width, true));
+        if (elided) lines.push(th.fg("dim", truncationNote(elided)));
+      }
+    } else {
+      return null;
+    }
     return lines.map(l => truncateToWidth(l, width));
   }
 }
