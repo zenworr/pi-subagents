@@ -1333,6 +1333,8 @@ export default function (pi: ExtensionAPI) {
     // run_in_background in that same turn keep going.
     const record = await manager.resume(id, prompt, undefined, {
       isBackground: true,
+      maxTurns: opts.maxTurns,
+      onTurnEnd: bgCallbacks.onTurnEnd,
       onToolActivity: bgCallbacks.onToolActivity,
       onAssistantUsage: bgCallbacks.onAssistantUsage,
       // Fires when the run actually starts — immediately, or on queue
@@ -2137,7 +2139,7 @@ Terse command-style prompts produce shallow, generic work.
           );
         }
 
-        const record = await manager.resume(params.resume, params.prompt, signal);
+        const record = await manager.resume(params.resume, params.prompt, signal, { maxTurns: effectiveMaxTurns });
         if (!record) {
           return textResult(`Failed to resume agent "${params.resume}".`);
         }
@@ -2146,8 +2148,9 @@ Terse command-style prompts produce shallow, generic work.
         if (record.status === "error") {
           return textResult(`Agent failed: ${record.error}${partialOutputSuffix(record)}`, buildDetails(detailBaseFor(record), record));
         }
+        const outcomeNote = getForegroundOutcomeNote(record.status);
         return textResult(
-          record.result?.trim() || "No output.",
+          `${record.result?.trim() || "No output."}${outcomeNote ? `\n\nResumed run${outcomeNote}.` : ""}`,
           buildDetails(detailBaseFor(record), record),
         );
       }

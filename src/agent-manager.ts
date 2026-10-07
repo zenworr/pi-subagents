@@ -19,7 +19,7 @@ import { statSync } from "node:fs";
 import { isAbsolute } from "node:path";
 import type { Model } from "@earendil-works/pi-ai";
 import type { AgentSession, ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { resumeAgent, runAgent, type ToolActivity } from "./agent-runner.js";
+import { resolveEffectiveMaxTurns, resumeAgent, runAgent, type ToolActivity } from "./agent-runner.js";
 import { assignHandle, handleBase } from "./mention.js";
 import { describeModel } from "./model-resolver.js";
 import type { AgentInvocation, AgentRecord, AgentTombstone, IsolationMode, MentionResolution, SubagentType, ThinkingLevel } from "./types.js";
@@ -310,6 +310,9 @@ interface ResumeOptions {
    * record — the historical behavior.
    */
   isBackground?: boolean;
+  /** The caller's turn limit for this resume. Undefined → the agent's own default. */
+  maxTurns?: number;
+  onTurnEnd?: (turnCount: number) => void;
   /** Called on tool start/end with activity info (for streaming progress to UI). */
   onToolActivity?: (activity: ToolActivity) => void;
   /** Called once per assistant message_end with that message's usage delta. */
@@ -1175,7 +1178,9 @@ export class AgentManager {
     record.error = undefined;
 
     try {
-      const { text, failure } = await resumeAgent(record.session, prompt, {
+      const { text, failure, aborted, steered } = await resumeAgent(record.session, prompt, {
+        maxTurns: resolveEffectiveMaxTurns(record.type, options?.maxTurns),
+        onTurnEnd: options?.onTurnEnd,
         onToolActivity: (activity) => {
           if (activity.type === "end") record.toolUses++;
           options?.onToolActivity?.(activity);
@@ -1194,8 +1199,8 @@ export class AgentManager {
       });
       // Same contract as the spawn path (#144): a failed final turn is an
       // error, not a completion — but the resumed text stays available.
-      record.status = failure ? "error" : "completed";
-      if (failure) record.error = failure;
+      record.status = aborted ? "aborted" : failure ? "error" : steered ? "steered" : "completed";
+      if (failure && !aborted) record.error = failure;
       record.result = text;
       record.completedAt = Date.now();
     } catch (err) {
@@ -1267,6 +1272,8 @@ export class AgentManager {
     };
 
     const promise = resumeAgent(record.session, prompt, {
+      maxTurns: resolveEffectiveMaxTurns(record.type, options.maxTurns),
+      onTurnEnd: options.onTurnEnd,
       onToolActivity: (activity) => {
         if (activity.type === "end") record.toolUses++;
         options.onToolActivity?.(activity);
@@ -1283,13 +1290,13 @@ export class AgentManager {
       },
       signal: abortController.signal,
     })
-      .then(({ text, failure }) => {
+      .then(({ text, failure, aborted, steered }) => {
         // Don't overwrite status if externally stopped via abort().
         if (record.status !== "stopped") {
           // Same contract as the spawn path (#144): a failed final turn is an
           // error, not a completion — but the resumed text stays available.
-          record.status = failure ? "error" : "completed";
-          if (failure) record.error = failure;
+          record.status = aborted ? "aborted" : failure ? "error" : steered ? "steered" : "completed";
+          if (failure && !aborted) record.error = failure;
         }
         record.result = text;
         record.completedAt ??= Date.now();
