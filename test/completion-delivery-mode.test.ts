@@ -23,17 +23,21 @@ describe("completionDeliveryMode", () => {
 
   async function completedNotifications(settings: Record<string, unknown>, count: number) {
     hermetic = hermeticDir({ settings: { schedulingEnabled: false, ...settings } });
-    const { pi, tools } = makePi();
+    const { pi, tools, lifecycle } = makePi();
+    const parentCtx = ctx({ signal: new AbortController().signal });
     vi.mocked(runAgent).mockImplementation(async () => {
       if (settings.defaultJoinMode === "group") await new Promise((resolve) => setTimeout(resolve, 180));
       return { responseText: "done", session: { dispose: vi.fn() } as any, aborted: false, steered: false };
     });
     subagentsExtension(pi);
+    await lifecycle.get("session_start")({}, parentCtx);
     const calls = Array.from({ length: count }, (_, i) => tools.get("Agent").execute(
       `tc-${i}`, { prompt: "go", description: `task ${i}`, subagent_type: "general-purpose", run_in_background: true },
-      undefined, undefined, ctx(),
+      undefined, undefined, parentCtx,
     ));
     await Promise.all(calls);
+    lifecycle.get("turn_end")({ message: { role: "assistant", stopReason: "toolUse" } });
+    parentCtx.signal = undefined;
     await flush();
     await vi.waitFor(() => expect(pi.sendMessage).toHaveBeenCalled(), { timeout: 5000 });
     return pi.sendMessage.mock.calls.filter(([message]: any[]) => message.customType === "subagent-notification");

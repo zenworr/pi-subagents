@@ -805,11 +805,11 @@ describe("ConversationViewer", () => {
 
     it("scrolls with the mouse wheel and follows again at the bottom", () => {
       const messages: any[] = lines(80);
-      const viewer = new ConversationViewer(mockTui(40, 80), mockSession(messages), mockRecord(), undefined, ansiTheme(), vi.fn());
+      const viewer = new ConversationViewer({ ...mockTui(40, 80), mode: "fullscreen" }, mockSession(messages), mockRecord(), undefined, ansiTheme(), vi.fn());
       viewer.render(80);
       const wheel = (wheelDelta: number) => viewer.handleMouse({ type: "wheel", wheelDelta } as any);
 
-      expect(wheel(-5)).toEqual({ handled: true });
+      expect(wheel(-5)).toEqual({ handled: true, render: true });
       messages.push({ role: "user", content: "newest" });
       expect(strip(viewer.render(80).join("\n"))).not.toContain("newest");
 
@@ -820,7 +820,7 @@ describe("ConversationViewer", () => {
 
     it("follows again when shrunk content puts the view at the bottom", () => {
       const messages: any[] = lines(80);
-      const viewer = new ConversationViewer(mockTui(40, 80), mockSession(messages), mockRecord(), undefined, ansiTheme(), vi.fn());
+      const viewer = new ConversationViewer({ ...mockTui(40, 80), mode: "fullscreen" }, mockSession(messages), mockRecord(), undefined, ansiTheme(), vi.fn());
       viewer.render(80);
       viewer.handleMouse({ type: "wheel", wheelDelta: -5 } as any);
 
@@ -831,9 +831,9 @@ describe("ConversationViewer", () => {
       expect(strip(viewer.render(80).join("\n"))).toContain("new 79");
     });
 
-    it("ignores mouse events other than the wheel", () => {
+    it("ignores mouse events in regular mode", () => {
       const viewer = new ConversationViewer(mockTui(), mockSession(lines(3)), mockRecord(), undefined, ansiTheme(), vi.fn());
-      expect(viewer.handleMouse({ type: "click", button: "left" } as any)).toBeUndefined();
+      expect(viewer.handleMouse({ type: "press", button: "left" } as any)).toEqual({ handled: false });
     });
   });
 

@@ -10,9 +10,13 @@ it.each([
   "@earendil-works/pi-ai",
   "@earendil-works/pi-coding-agent",
   "@earendil-works/pi-tui",
-  "@sinclair/typebox",
   "typebox",
 ])("uses the host-provided %s package", (name) => {
   expect(manifest.dependencies).not.toHaveProperty(name);
   expect(manifest.peerDependencies[name]).toBe("*");
+});
+
+it("does not request the legacy TypeBox package from the host", () => {
+  expect(manifest.dependencies).not.toHaveProperty("@sinclair/typebox");
+  expect(manifest.peerDependencies).not.toHaveProperty("@sinclair/typebox");
 });
