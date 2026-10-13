@@ -19,7 +19,8 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { AgentManager } from "../src/agent-manager.js";
 
-vi.mock("../src/agent-runner.js", () => ({
+vi.mock("../src/agent-runner.js", async () => ({
+  ...await vi.importActual("../src/agent-runner.js"),
   runAgent: vi.fn(),
   resumeAgent: vi.fn(),
 }));

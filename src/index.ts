@@ -1151,7 +1151,6 @@ export default function (pi: ExtensionAPI) {
     for (const task of workflowTasks.values()) task.abortController.abort();
     workflowTasks.clear();
     manager.abortAll();
-    outbox.dispose();
     fleet.dispose();
     unsubHandoffKey?.();
     unsubHandoffKey = undefined;
@@ -1164,8 +1163,7 @@ export default function (pi: ExtensionAPI) {
     // Last, so that runs which settle during the dispose above cannot restart
     // their timers in this dead session.
     groupJoin.dispose();
-    if (batchFinalizeTimer) clearTimeout(batchFinalizeTimer);
-    batchFinalizeTimer = undefined;
+    outbox.dispose();
     widget.dispose();
   });
 
