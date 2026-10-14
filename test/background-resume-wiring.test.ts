@@ -287,4 +287,81 @@ describe("Agent tool — background resume wiring", () => {
 
     await lifecycle.get("session_shutdown")?.({}, ctx);
   });
+
+  it.each(["aborted", "steered"] as const)("resumes by handle with fresh activity and an honest %s result", async (status) => {
+    const { pi, tools, lifecycle } = makePi();
+    subagentsExtension(pi);
+    const ctx = makeCtx(cwd);
+    const id = await spawnSettled(tools, ctx);
+
+    vi.mocked(resumeAgent).mockImplementation(async (_session, _prompt, options) => {
+      options.onTurnEnd?.(3);
+      options.onToolActivity?.({ type: "end", toolName: "read" });
+      return { text: "partial answer", aborted: status === "aborted", steered: status === "steered" };
+    });
+    const res = await tools.get("Agent").execute(
+      "resume-call",
+      { prompt: "keep going", description: "Keep going", subagent_type: "Explore", resume: "general-purpose", run_in_background: false, max_turns: 7 },
+      undefined,
+      undefined,
+      ctx,
+    );
+
+    expect(vi.mocked(resumeAgent).mock.calls.at(-1)?.[2]).toMatchObject({ type: "general-purpose", maxTurns: 7 });
+    expect(res.details).toMatchObject({ agentId: id, status, turnCount: 3, maxTurns: 7, toolUses: 1 });
+    expect(resultText(res)).toContain("partial answer");
+    expect(resultText(res)).toContain("turn limit");
+    expect(resultText(res)).toContain("unfinished");
+    expect(resultText(res)).not.toContain("You will be notified");
+
+    await lifecycle.get("session_shutdown")?.({}, ctx);
+  });
+
+  // #368 — the turn limit a spawn enforces must reach a resume too. Neither
+  // resume branch handed the effective max_turns or a turn counter to the
+  // runner, so a resumed agent ran unbounded and its widget stayed at turn 1.
+  it("passes the effective turn limit and a turn counter to a background resume (#368)", async () => {
+    const { pi, tools, lifecycle } = makePi();
+    subagentsExtension(pi);
+    const ctx = makeCtx(cwd);
+    const id = await spawnSettled(tools, ctx);
+
+    vi.mocked(resumeAgent).mockClear();
+    await tools.get("Agent").execute(
+      "resume-call",
+      { prompt: "keep going", description: "Keep going", subagent_type: "general-purpose", resume: id, run_in_background: true, max_turns: 7 },
+      undefined,
+      undefined,
+      ctx,
+    );
+    await new Promise((r) => setTimeout(r, 0));
+
+    expect(resumeAgent).toHaveBeenCalledTimes(1);
+    const opts = vi.mocked(resumeAgent).mock.calls[0][2];
+    expect(opts.maxTurns).toBe(7);
+    expect(typeof opts.onTurnEnd).toBe("function");
+
+    await lifecycle.get("session_shutdown")?.({}, ctx);
+  });
+
+  it("passes the effective turn limit to a foreground resume (#368)", async () => {
+    const { pi, tools, lifecycle } = makePi();
+    subagentsExtension(pi);
+    const ctx = makeCtx(cwd);
+    const id = await spawnSettled(tools, ctx);
+
+    vi.mocked(resumeAgent).mockClear();
+    await tools.get("Agent").execute(
+      "resume-call",
+      { prompt: "keep going", description: "Keep going", subagent_type: "general-purpose", resume: id, run_in_background: false, max_turns: 7 },
+      undefined,
+      undefined,
+      ctx,
+    );
+
+    expect(resumeAgent).toHaveBeenCalledTimes(1);
+    expect(vi.mocked(resumeAgent).mock.calls[0][2].maxTurns).toBe(7);
+
+    await lifecycle.get("session_shutdown")?.({}, ctx);
+  });
 });

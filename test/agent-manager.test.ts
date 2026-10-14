@@ -801,6 +801,117 @@ describe("AgentManager — lifetime usage + compaction count are eagerly initial
     expect(manager.getRecord(id)!.lifetimeUsage).toEqual({ input: 70, output: 30, cacheWrite: 5, cost: 0.007 });
     expect(manager.getRecord(id)!.compactionCount).toBe(1);
   });
+
+  // #368 — a resumed run is bounded like a spawn, so its outcome must map the
+  // same way: a hard abort is "aborted", a wrap-up is "steered".
+  describe("resume() turn-limit outcome (#368)", () => {
+    async function spawnSettled() {
+      manager = new AgentManager();
+      vi.mocked(runAgent).mockResolvedValue({
+        responseText: "first",
+        session: mockSession() as any,
+        aborted: false,
+        steered: false,
+      });
+      const id = manager.spawn(mockPi, mockCtx, "general-purpose", "test", { description: "test", isBackground: true });
+      await manager.getRecord(id)!.promise;
+      return id;
+    }
+
+    it("hands the record's type, the explicit limit and the turn counter to the runner", async () => {
+      const id = await spawnSettled();
+      vi.mocked(resumeAgent).mockResolvedValue({ text: "second", aborted: false, steered: false });
+      const onTurnEnd = vi.fn();
+
+      await manager.resume(id, "more", undefined, { maxTurns: 3, onTurnEnd });
+
+      const opts = vi.mocked(resumeAgent).mock.calls.at(-1)![2]!;
+      expect(opts.type).toBe("general-purpose");
+      expect(opts.maxTurns).toBe(3);
+      expect(opts.onTurnEnd).toBe(onTurnEnd);
+    });
+
+    it("falls back to the limit the agent was spawned with when the caller passes none", async () => {
+      manager = new AgentManager();
+      vi.mocked(runAgent).mockResolvedValue({ responseText: "first", session: mockSession() as any, aborted: false, steered: false });
+      const id = manager.spawn(mockPi, mockCtx, "general-purpose", "test", {
+        description: "test",
+        isBackground: true,
+        invocation: { maxTurns: 50 },
+      });
+      await manager.getRecord(id)!.promise;
+      vi.mocked(resumeAgent).mockResolvedValue({ text: "second", aborted: false, steered: false });
+
+      await manager.resume(id, "more");
+      expect(vi.mocked(resumeAgent).mock.calls.at(-1)![2]!.maxTurns).toBe(50);
+
+      await (await manager.resume(id, "again", undefined, { isBackground: true }))!.promise;
+      expect(vi.mocked(resumeAgent).mock.calls.at(-1)![2]!.maxTurns).toBe(50);
+    });
+
+    it("inline: abort() reaches the resumed run and the record stays stopped", async () => {
+      const id = await spawnSettled();
+      let runSignal: AbortSignal | undefined;
+      let finish!: () => void;
+      vi.mocked(resumeAgent).mockImplementation((_s, _p, opts) => {
+        runSignal = opts.signal;
+        return new Promise((resolve) => { finish = () => resolve({ text: "partial", aborted: false, steered: false }); });
+      });
+
+      const resumed = manager.resume(id, "more");
+      await new Promise((r) => setTimeout(r, 0));
+      expect(manager.abort(id)).toBe(true);
+      expect(runSignal?.aborted).toBe(true);
+
+      finish();
+      await resumed;
+      expect(manager.getRecord(id)!.status).toBe("stopped");
+      expect(manager.getRecord(id)!.result).toBe("partial");
+    });
+
+    it("inline: a caller signal that is already aborted stops the resume before it runs", async () => {
+      const id = await spawnSettled();
+      let runSignal: AbortSignal | undefined;
+      vi.mocked(resumeAgent).mockImplementation(async (_s, _p, opts) => {
+        runSignal = opts.signal;
+        return { text: "", aborted: false, steered: false };
+      });
+
+      const cancelled = new AbortController();
+      cancelled.abort();
+      await manager.resume(id, "more", cancelled.signal);
+
+      expect(manager.getRecord(id)!.status).toBe("stopped");
+      expect(runSignal?.aborted).toBe(true);
+    });
+
+    it("inline: a steered resume ends steered, an aborted one aborted", async () => {
+      const id = await spawnSettled();
+
+      vi.mocked(resumeAgent).mockResolvedValue({ text: "wrapped", aborted: false, steered: true });
+      await manager.resume(id, "more");
+      expect(manager.getRecord(id)!.status).toBe("steered");
+      expect(manager.getRecord(id)!.result).toBe("wrapped");
+
+      vi.mocked(resumeAgent).mockResolvedValue({ text: "cut", aborted: true, steered: true });
+      await manager.resume(id, "again");
+      expect(manager.getRecord(id)!.status).toBe("aborted");
+      expect(manager.getRecord(id)!.result).toBe("cut");
+    });
+
+    it("background: a steered resume ends steered, an aborted one aborted", async () => {
+      const id = await spawnSettled();
+
+      vi.mocked(resumeAgent).mockResolvedValue({ text: "wrapped", aborted: false, steered: true });
+      await (await manager.resume(id, "more", undefined, { isBackground: true }))!.promise;
+      expect(manager.getRecord(id)!.status).toBe("steered");
+
+      vi.mocked(resumeAgent).mockResolvedValue({ text: "cut", aborted: true, steered: true });
+      await (await manager.resume(id, "again", undefined, { isBackground: true }))!.promise;
+      expect(manager.getRecord(id)!.status).toBe("aborted");
+      expect(manager.getRecord(id)!.result).toBe("cut");
+    });
+  });
 });
 
 // Regression: `isolation: "worktree"` MUST fail loud when the cwd can't host
@@ -1937,6 +2048,40 @@ describe("AgentManager — pendingSteers flush", () => {
     expect(steer.mock.calls.map(c => c[0])).toEqual(["first correction", "second correction"]);
     // Cleared, or every later session creation would re-deliver the same steers.
     expect(record.pendingSteers).toBeUndefined();
+  });
+
+  // The viewers, an @handle and the RPC all steer through the manager and none
+  // of them emits the lifecycle event itself — this callback is the one place
+  // `subagents:steered` comes from for every path except the tool.
+  it("fires onSteered for a queued and a delivered steer, never for a refused one", async () => {
+    const steer = vi.fn().mockResolvedValue(undefined);
+    let createSession: (() => void) | undefined;
+    let finish: (() => void) | undefined;
+    vi.mocked(runAgent).mockImplementation((_ctx: any, _type: any, _prompt: any, opts: any) =>
+      new Promise<any>(resolve => {
+        createSession = () => opts.onSessionCreated?.({ steer, dispose: vi.fn() });
+        finish = () => resolve({ responseText: "ok", session: mockSession(), aborted: false, steered: false });
+      }),
+    );
+
+    const onSteered = vi.fn();
+    manager = new AgentManager(undefined, undefined, undefined, undefined, undefined, onSteered);
+    const id = manager.spawn(mockPi, mockCtx, "X", "p", { description: "p", isBackground: true });
+    const record = manager.getRecord(id)!;
+
+    expect(manager.steer(id, "before session")).toBe(true);
+    expect(onSteered).toHaveBeenLastCalledWith(record, "before session");
+
+    createSession!();
+    expect(manager.steer(id, "live")).toBe(true);
+    expect(steer).toHaveBeenLastCalledWith("live");
+    expect(onSteered).toHaveBeenLastCalledWith(record, "live");
+    expect(onSteered).toHaveBeenCalledTimes(2);
+
+    finish!();
+    await record.promise;
+    expect(manager.steer(id, "too late")).toBe(false);
+    expect(onSteered).toHaveBeenCalledTimes(2);
   });
 
   it("a steer that rejects does not fail the run", async () => {

@@ -653,23 +653,70 @@ function finalTurnError(session: AgentSession, startIndex = 0): string | undefin
   return undefined;
 }
 
-/** Steer the session to wrap up at `maxTurns`, and abort it `graceTurns` later. */
-function enforceTurnLimit(session: AgentSession, maxTurns: number | undefined, onTurnEnd?: (turnCount: number) => void) {
-  const state = { turnCount: 0, softLimitReached: false, aborted: false };
-  const unsubscribe = session.subscribe((event: AgentSessionEvent) => {
-    if (event.type !== "turn_end") return;
-    state.turnCount++;
-    onTurnEnd?.(state.turnCount);
-    if (maxTurns == null) return;
-    if (!state.softLimitReached && state.turnCount >= maxTurns) {
-      state.softLimitReached = true;
-      session.steer("You have reached your turn limit. Wrap up immediately — provide your final answer now.");
-    } else if (state.softLimitReached && state.turnCount >= maxTurns + graceTurns) {
-      state.aborted = true;
-      session.abort();
+/** The per-run callbacks a spawn and a resume share, plus the resolved turn limit. */
+type RunObserverOptions = Pick<RunOptions, "onTurnEnd" | "onTextDelta" | "onToolActivity" | "onAssistantUsage" | "onCompaction"> & {
+  /** Already resolved: undefined = unlimited. */
+  maxTurns?: number;
+};
+
+/**
+ * Observe one prompt of a session — a spawn's or a resume's — and enforce its
+ * turn limit: steer once at `maxTurns`, hard-abort after the grace turns.
+ * `steered` / `aborted` are live fields, read while the prompt is still in
+ * flight (the structured-output retry) and after it settles (the result).
+ * Shared by `runAgent` and `resumeAgent` so a resumed run is bounded exactly
+ * like the first one (#368).
+ */
+function observeRun(session: AgentSession, options: RunObserverOptions) {
+  let turnCount = 0;
+  let currentMessageText = "";
+  const run = {
+    steered: false,
+    aborted: false,
+    unsubscribe: () => {},
+  };
+  run.unsubscribe = session.subscribe((event: AgentSessionEvent) => {
+    if (event.type === "turn_end") {
+      turnCount++;
+      options.onTurnEnd?.(turnCount);
+      if (options.maxTurns != null) {
+        if (!run.steered && turnCount >= options.maxTurns) {
+          run.steered = true;
+          session.steer("You have reached your turn limit. Wrap up immediately — provide your final answer now.");
+        } else if (run.steered && turnCount >= options.maxTurns + graceTurns) {
+          run.aborted = true;
+          session.abort();
+        }
+      }
+    }
+    if (event.type === "message_start") {
+      currentMessageText = "";
+    }
+    if (event.type === "message_update" && event.assistantMessageEvent.type === "text_delta") {
+      currentMessageText += event.assistantMessageEvent.delta;
+      options.onTextDelta?.(event.assistantMessageEvent.delta, currentMessageText);
+    }
+    if (event.type === "tool_execution_start") {
+      options.onToolActivity?.({ type: "start", toolName: event.toolName });
+    }
+    if (event.type === "tool_execution_end") {
+      options.onToolActivity?.({ type: "end", toolName: event.toolName });
+    }
+    if (event.type === "message_end" && event.message.role === "assistant") {
+      const u = (event.message as any).usage;
+      if (u) options.onAssistantUsage?.({
+        input: u.input ?? 0,
+        output: u.output ?? 0,
+        cacheWrite: u.cacheWrite ?? 0,
+        cacheRead: u.cacheRead ?? 0,
+        cost: u.cost?.total ?? 0,
+      });
+    }
+    if (event.type === "compaction_end" && !event.aborted && event.result) {
+      options.onCompaction?.({ reason: event.reason, tokensBefore: event.result.tokensBefore });
     }
   });
-  return { state, unsubscribe };
+  return run;
 }
 
 /**
@@ -1171,37 +1218,7 @@ export async function runAgent(
 
   options.onSessionCreated?.(session);
 
-  const turns = enforceTurnLimit(session, resolveEffectiveMaxTurns(type, options.maxTurns), options.onTurnEnd);
-
-  let currentMessageText = "";
-  const unsubEvents = session.subscribe((event: AgentSessionEvent) => {
-    if (event.type === "message_start") {
-      currentMessageText = "";
-    }
-    if (event.type === "message_update" && event.assistantMessageEvent.type === "text_delta") {
-      currentMessageText += event.assistantMessageEvent.delta;
-      options.onTextDelta?.(event.assistantMessageEvent.delta, currentMessageText);
-    }
-    if (event.type === "tool_execution_start") {
-      options.onToolActivity?.({ type: "start", toolName: event.toolName });
-    }
-    if (event.type === "tool_execution_end") {
-      options.onToolActivity?.({ type: "end", toolName: event.toolName });
-    }
-    if (event.type === "message_end" && event.message.role === "assistant") {
-      const u = (event.message as any).usage;
-      if (u) options.onAssistantUsage?.({
-        input: u.input ?? 0,
-        output: u.output ?? 0,
-        cacheWrite: u.cacheWrite ?? 0,
-        cacheRead: u.cacheRead ?? 0,
-        cost: u.cost?.total ?? 0,
-      });
-    }
-    if (event.type === "compaction_end" && !event.aborted && event.result) {
-      options.onCompaction?.({ reason: event.reason, tokensBefore: event.result.tokensBefore });
-    }
-  });
+  const run = observeRun(session, { ...options, maxTurns: resolveEffectiveMaxTurns(type, options.maxTurns) });
 
   const collector = collectResponseText(session);
   const cleanupAbort = forwardAbortSignal(session, options.signal);
@@ -1231,13 +1248,12 @@ export async function runAgent(
     // the abort forwarding are still live: torn down first, a retry would be
     // unkillable.
     if (structuredCapture !== undefined && structuredCapture.json === undefined
-      && !turns.state.aborted && options.signal?.aborted !== true) {
+      && !run.aborted && options.signal?.aborted !== true) {
       structuredRetried = true;
       await session.prompt(structuredRetryPrompt(structuredCapture));
     }
   } finally {
-    turns.unsubscribe();
-    unsubEvents();
+    run.unsubscribe();
     collector.unsubscribe();
     cleanupAbort();
   }
@@ -1254,8 +1270,8 @@ export async function runAgent(
   return {
     responseText,
     session,
-    aborted: turns.state.aborted,
-    steered: turns.state.softLimitReached,
+    aborted: run.aborted,
+    steered: run.steered,
     failure: finalTurnError(session, startLen) ?? structuredFailure,
     ...(structuredCapture?.json !== undefined ? { structuredJson: structuredCapture.json } : {}),
     ...(structuredRetried ? { structuredRetried } : {}),
@@ -1263,64 +1279,41 @@ export async function runAgent(
 }
 
 /**
- * Send a new prompt to an existing session (resume).
+ * Send a new prompt to an existing session (resume). A fresh run of the same
+ * agent: the turn limit is resolved as `runAgent` resolves it — an explicit
+ * `maxTurns`, else the agent type's own `max_turns`, else the project default
+ * — and counted from this prompt (#368).
  */
 export async function resumeAgent(
   session: AgentSession,
   prompt: string,
-  options: {
-    /** Already resolved: `resolveEffectiveMaxTurns()`. Undefined → unlimited. */
-    maxTurns?: number;
-    onTurnEnd?: (turnCount: number) => void;
-    onToolActivity?: (activity: ToolActivity) => void;
-    onAssistantUsage?: (usage: LifetimeUsage) => void;
-    onCompaction?: (info: { reason: "manual" | "threshold" | "overflow"; tokensBefore: number }) => void;
-    signal?: AbortSignal;
-  } = {},
-): Promise<{ text: string; failure?: string; aborted: boolean; steered: boolean }> {
+  options: Pick<RunOptions, "maxTurns" | "onTurnEnd" | "onToolActivity" | "onAssistantUsage" | "onCompaction" | "signal"> & {
+    /** The agent's type, for its own `max_turns`. */
+    type: SubagentType;
+  },
+): Promise<{ text: string; failure?: string } & Pick<RunResult, "aborted" | "steered">> {
   // Boundary for the history fallback: the session already holds prior turns,
   // so only assistant text produced by THIS resume prompt counts as its output
   // — a failed resume must not surface the previous turn's answer (#144).
   const startLen = session.messages.length;
   const collector = collectResponseText(session);
   const cleanupAbort = forwardAbortSignal(session, options.signal);
-  const turns = enforceTurnLimit(session, options.maxTurns, options.onTurnEnd);
-
-  const unsubEvents = (options.onToolActivity || options.onAssistantUsage || options.onCompaction)
-    ? session.subscribe((event: AgentSessionEvent) => {
-        if (event.type === "tool_execution_start") options.onToolActivity?.({ type: "start", toolName: event.toolName });
-        if (event.type === "tool_execution_end") options.onToolActivity?.({ type: "end", toolName: event.toolName });
-        if (event.type === "message_end" && event.message.role === "assistant") {
-          const u = (event.message as any).usage;
-          if (u) options.onAssistantUsage?.({
-            input: u.input ?? 0,
-            output: u.output ?? 0,
-            cacheWrite: u.cacheWrite ?? 0,
-            cacheRead: u.cacheRead ?? 0,
-            cost: u.cost?.total ?? 0,
-          });
-        }
-        if (event.type === "compaction_end" && !event.aborted && event.result) {
-          options.onCompaction?.({ reason: event.reason, tokensBefore: event.result.tokensBefore });
-        }
-      })
-    : () => {};
+  const run = observeRun(session, { ...options, maxTurns: resolveEffectiveMaxTurns(options.type, options.maxTurns) });
 
   try {
     // Already aborted: not prompted, as in `runAgent`.
     if (options.signal?.aborted !== true) await session.prompt(prompt);
   } finally {
-    turns.unsubscribe();
     collector.unsubscribe();
-    unsubEvents();
+    run.unsubscribe();
     cleanupAbort();
   }
 
   return {
     text: collector.getText().trim() || getLastAssistantText(session, startLen),
     failure: finalTurnError(session, startLen),
-    aborted: turns.state.aborted,
-    steered: turns.state.softLimitReached,
+    aborted: run.aborted,
+    steered: run.steered,
   };
 }
 

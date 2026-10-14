@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.22.1] - 2026-10-14
+
+### Added
+- **`subagents:rpc:steer` lets a cross-extension caller message an agent it spawned** ([#292](https://github.com/tintinweb/pi-subagents/pull/292) — thanks [@efpiva](https://github.com/efpiva)). The bus-side half of `steer_subagent`: id only, the same ownership guard as `stop`, `Agent is not running` once the agent has settled, and it emits `subagents:steered` like the tool does. Outside the `ping` handshake like `consume`.
+- **Per-message `subagents:usage` event for every agent, and `subagents:disposed` at shutdown** (closes [#376](https://github.com/tintinweb/pi-subagents/issues/376), [#377](https://github.com/tintinweb/pi-subagents/pull/377) — thanks [@erikdarlingdata](https://github.com/erikdarlingdata)). Another extension could not keep a live, accurate ledger of subagent spend: the lifecycle events report top-level agents only, once, at the end, and the ancestor records fold a nested child's spend into every parent. `subagents:usage` now fires once per assistant message for every agent, nested and workflow children included, carrying `type`, `model`, the effective `thinking` level (plus `requestedThinking` when the agent did not get what it asked for), `depth`, `parentAgentId`, `workflowId` and that one message's spend as a pi `Usage`. It is not gated by `reportUsage`. `subagents:disposed` fires at the end of `session_shutdown`, after every agent is stopped, as the point after which a final synchronous flush is complete. See [Events](README.md#events).
+
+### Fixed
+- **Foreground resumes accept agent handles and retain partial-output warnings.** The result shows the resumed run's turn count and limit, even when the caller supplies a different `subagent_type`.
+- **Steering from the conversation viewer or the fleet list now emits `subagents:steered`.** Only the `steer_subagent` tool and an `@handle` steer did before, so an extension watching the event missed every steer typed into a viewer. The event now fires from `AgentManager.steer`, which every path except the steer tools goes through.
+- **Resumed agents are bounded by `max_turns` again, and their turn counter moves** (fixes [#368](https://github.com/tintinweb/pi-subagents/issues/368) — thanks [@mratsim](https://github.com/mratsim)). The steer → grace → abort machine ran only over a spawn's first prompt, so a resume — from the `Agent` tool, an `@handle`, a nested agent or a workflow — had no turn limit at all and its widget row stayed at `↻1`. A resumed run now gets a fresh budget counted from the resume prompt, resolved as for a spawn, and can end `steered` or `aborted` like the first run.
+
+## [0.22.0] - 2026-10-13
+
 > **⚠️ Possibly breaking — background completion delivery changed ([#388](https://github.com/tintinweb/pi-subagents/pull/388)):**
 > - **`smart`, the default join mode, no longer combines a turn's background agents into one notification.** Each result reaches the parent at its next boundary, so a parent waiting idle on several agents can take one turn per finish. Set the join mode to `group` for one notification per turn's batch.
 > - **A completion pending when you press Esc now starts a turn once the interrupted turn stops.**
@@ -21,6 +34,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 - **Background completions that finish together reach the parent as one message, and none waits for its siblings, as in Claude Code** ([#388](https://github.com/tintinweb/pi-subagents/pull/388)). A busy parent gets everything that finished during its tool batch in one message before its next model call; an idle parent gets a turn about 200 ms after a completion, with anything else that finished in that window. The default `smart` join mode no longer holds a finished agent for up to 30 s until its siblings finish (`async` now means the same as `smart`). `group` batches by parent turn instead of a 100 ms spawn window, so worktree agents group reliably. A completion pending when you press Esc is no longer dropped: it is delivered once the interrupted turn stops, starting a turn, as Claude Code does. `get_subagent_result` now suppresses a notification any time before it is sent, not only within 200 ms.
+
+### Fixed
+- **`session_shutdown` now disposes the widget and group-join manager** (fixes [#256](https://github.com/tintinweb/pi-subagents/issues/256), [#316](https://github.com/tintinweb/pi-subagents/pull/316) — thanks [@joshua-zyy](https://github.com/joshua-zyy)). The handler released the fleet, scheduler and manager but left the `AgentWidget` render interval and the `GroupJoinManager` group timeouts running. Because `session_shutdown` also fires on reload and session replacement, where the Node process survives, those timers outlived the activation and fired into the next session's UI and group state, accumulating across reloads. `session_before_switch` still keeps both, since a vetoed switch continues the session.
 
 ## [0.21.0] - 2026-10-12
 
