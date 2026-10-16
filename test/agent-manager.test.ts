@@ -22,7 +22,7 @@ vi.mock("../src/worktree.js", () => ({
 
 import { resumeAgent, runAgent } from "../src/agent-runner.js";
 import { addUsage } from "../src/usage.js";
-import { createWorktree, isWorktreeIsolationEnabled } from "../src/worktree.js";
+import { cleanupWorktree, createWorktree, isWorktreeIsolationEnabled } from "../src/worktree.js";
 
 const mockPi = {} as any;
 const mockCtx = { cwd: "/tmp" } as any;
@@ -2787,5 +2787,127 @@ describe("AgentManager — the agent file's `isolation` wins over the spawn opti
     await manager.awaitStartup(id);
 
     expect(createWorktree).toHaveBeenCalledTimes(1);
+  });
+});
+
+// A run the runner gave up on (`abandoned`) may still have a tool working in
+// its session and its worktree, so the manager must not treat it as finished.
+describe("AgentManager — abandoned runs", () => {
+  let manager: AgentManager;
+
+  afterEach(() => {
+    manager?.dispose();
+    vi.mocked(createWorktree).mockReset();
+  });
+
+  it("keeps the worktree of an abandoned run instead of committing and removing it", async () => {
+    vi.mocked(cleanupWorktree).mockClear();
+    vi.mocked(createWorktree).mockResolvedValueOnce({ path: "/tmp/wt-1", branch: "pi-agent-1", baseSha: "abc", workPath: "/tmp/wt-1" });
+    vi.mocked(runAgent).mockResolvedValueOnce({
+      responseText: "half",
+      session: mockSession(),
+      aborted: false,
+      steered: false,
+      abandoned: true,
+    });
+    const onBeforeWorktreeCleanup = vi.fn();
+    manager = new AgentManager();
+
+    const id = manager.spawn(mockPi, mockCtx, "general-purpose", "go", {
+      description: "d",
+      isBackground: true,
+      isolation: "worktree",
+      onBeforeWorktreeCleanup,
+    });
+    await manager.awaitStartup(id);
+    await manager.getRecord(id)!.promise;
+
+    expect(cleanupWorktree).not.toHaveBeenCalled();
+    expect(onBeforeWorktreeCleanup).not.toHaveBeenCalled();
+    expect(manager.getRecord(id)!.result).toContain("/tmp/wt-1");
+  });
+
+  it("refuses to resume a session still busy with a stopped run's tool, keeping the stopped result", async () => {
+    vi.mocked(runAgent).mockResolvedValueOnce({
+      responseText: "partial",
+      session: { dispose: vi.fn(), isStreaming: true } as any,
+      aborted: false,
+      steered: false,
+      abandoned: true,
+    });
+    manager = new AgentManager();
+    const id = manager.spawn(mockPi, mockCtx, "general-purpose", "go", { description: "d", isBackground: true });
+    const record = manager.getRecord(id)!;
+    await record.promise;
+    vi.mocked(resumeAgent).mockClear();
+
+    expect(await manager.resume(id, "again", undefined, { isBackground: true })).toBeUndefined();
+    expect(await manager.resume(id, "again")).toBeUndefined();
+
+    expect(resumeAgent).not.toHaveBeenCalled();
+    expect(record.result).toBe("partial");
+    expect(record.status).toBe("completed");
+  });
+
+  it("tears down a session that was given up on during session_start instead of keeping it for a resume", async () => {
+    const session = { dispose: vi.fn() } as any;
+    vi.mocked(runAgent).mockResolvedValueOnce({
+      responseText: "",
+      session,
+      aborted: false,
+      steered: false,
+      abandoned: true,
+      unboundSession: true,
+    });
+    manager = new AgentManager();
+    const id = manager.spawn(mockPi, mockCtx, "general-purpose", "go", { description: "d", isBackground: true });
+    await manager.getRecord(id)!.promise;
+
+    expect(manager.getRecord(id)!.session).toBeUndefined();
+    await vi.waitFor(() => expect(session.dispose).toHaveBeenCalled());
+    expect(await manager.resume(id, "again")).toBeUndefined();
+  });
+
+  it("refuses to resume a stopped agent that is still settling", async () => {
+    let finish!: (v: any) => void;
+    const session = mockSession();
+    vi.mocked(runAgent).mockReturnValueOnce(new Promise((resolve) => { finish = resolve; }));
+    manager = new AgentManager();
+    const id = manager.spawn(mockPi, mockCtx, "general-purpose", "go", { description: "d", isBackground: true });
+    const record = manager.getRecord(id)!;
+    record.session = session;
+    const pending = record.promise;
+
+    manager.abort(id);
+    expect(record.stopping).toBe(true);
+    expect(await manager.resume(id, "again", undefined, { isBackground: true })).toBeUndefined();
+    expect(record.promise).toBe(pending);
+
+    finish({ responseText: "partial", session, aborted: false, steered: false });
+    await record.promise;
+    expect(record.stopping).toBeUndefined();
+    expect(record.status).toBe("stopped");
+  });
+
+  it("points record.promise at a foreground resume's own run", async () => {
+    resolvedRun();
+    manager = new AgentManager();
+    const id = manager.spawn(mockPi, mockCtx, "general-purpose", "go", { description: "d", isBackground: true });
+    const record = manager.getRecord(id)!;
+    await record.promise;
+    const spawnPromise = record.promise;
+    let finish!: (v: any) => void;
+    vi.mocked(resumeAgent).mockReturnValueOnce(new Promise((resolve) => { finish = resolve; }));
+
+    const resuming = manager.resume(id, "again");
+
+    expect(record.promise).not.toBe(spawnPromise);
+    let settled = false;
+    void record.promise!.then(() => { settled = true; });
+    await Promise.resolve();
+    expect(settled).toBe(false);
+    finish({ text: "second", aborted: false, steered: false });
+    await resuming;
+    expect(await record.promise).toBe("second");
   });
 });

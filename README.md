@@ -12,14 +12,14 @@ https://github.com/user-attachments/assets/8685261b-9338-4fea-8dfe-1c590d5df543
 
 ## Features
 
-- **Claude Code look & feel** — same tool names, calling conventions, and UI patterns (`Agent`, `get_subagent_result`, `steer_subagent`) — feels native
+- **Claude Code look & feel** — same tool names, calling conventions, and UI patterns (`Agent`, `get_subagent_result`, `steer_subagent`, `stop_subagent`) — feels native
 - **Parallel background agents** — spawn multiple agents that run concurrently with automatic queuing (configurable concurrency limit, default 10) and completion notifications that reach the parent at its next boundary, several at once when they finish together
 - **Live widget UI** — persistent above-editor widget with animated spinners, live tool activity, token counts, and colored status icons. Configurable via `/agents → Settings → Widget`: `all` (every agent), `background` (default — hides foreground runs, which already render inline as the `Agent` tool result), or `off`
 - **FleetView** — Claude Code-style navigable list of `main` + every running subagent rendered below the editor (earliest-launched first). Press `↓` (or `←`) at an empty prompt to jump in, `↑`/`↓` to move the selection, `Enter` to open the selected agent's live, auto-updating conversation, `Esc` to return. Finished agents linger briefly before dropping out, and a viewer stays open through completion so you can read the final output. Toggle via `/agents → Settings → Fleet view`
 - **Conversation viewer** — select any agent in `/agents` to open a live-scrolling overlay of its full conversation (auto-follows new content, scroll up to pause). In pi's fullscreen mode it is a borderless, full-terminal observer with mouse support. Steer a running agent inline by pressing `Enter` to open a composer, typing, then `Enter` to send (`Esc` or an empty submit returns) — the message appears as a user message and redirects the agent after its current tool. Press `b` on a running foreground `Agent` call to hand that run to the background (see [Sending a foreground agent to the background](#sending-a-foreground-agent-to-the-background)). Stop a still-running agent by pressing `x` (then `x` again to confirm) — steer and stop both work for background agents too. Assistant text renders as Markdown; `m` cycles that between off, assistant-only and everything (see [Viewer markdown](#persistent-settings))
 - **Custom agent types** — define agents in `.pi/agents/<name>.md` or `.agents/agents/<name>.md` (project) or globally, with YAML frontmatter: custom system prompts, model selection, thinking levels, tool restrictions, and Claude Code-compatible colored name badges
 - **Package-shipped agents** — a pi package can declare its own subagents (and workflow scripts) with `"pi": { "subagents": { "agents": ["./agents"] } }` in its `package.json`, so `pi install` is the whole setup: no copying files into `.pi/agents/` on every machine or container start. Only packages pi has actually installed are read (never `node_modules`), package definitions rank below every agent you wrote, and `/agents` shows them read-only with Eject and Disable. Narrow or switch it off with `packageAgents` / `packageWorkflows`. **[Full guide](https://github.com/tintinweb/pi-subagents/blob/master/docs/packages.md)**
-- **Nested subagents** — opt-in, default-off delegation: a custom agent that sets `allowed_subagents` gets its own ownership-scoped `Agent`, `get_subagent_result`, and `steer_subagent` tools, depth-capped from the main session (default 2). It can control only its own children, they are stopped when it finishes, and their transcripts and token spend roll up to it. The allowlist is a privilege boundary — a child runs with its own tools, so pick it as carefully as `tools:` itself
+- **Nested subagents** — opt-in, default-off delegation: a custom agent that sets `allowed_subagents` gets its own ownership-scoped `Agent`, `get_subagent_result`, `steer_subagent`, and `stop_subagent` tools, depth-capped from the main session (default 2). It can control only its own children, they are stopped when it finishes, and their transcripts and token spend roll up to it. The allowlist is a privilege boundary — a child runs with its own tools, so pick it as carefully as `tools:` itself
 - **Agent mentions** — subagents are first-class: type `@explore also check the RPC path` at the prompt and it goes to that agent instead of the main model, without a word of it entering the chat. One syntax covers the whole lifecycle — message it while it runs, resume it once it has finished, reopen its session from disk long after that, or start it if it never ran. Mentioning an agent that isn't running spawns it through an off-screen clone of the conversation, so it gets Claude Code's context-written prompt and a real `Agent` tool call without a word of it reaching the chat; `direct` mode starts it here from your text instead, with no model call at all. The orchestrator can `name` an agent so you address it as `@auth-audit`, and handles work in `steer_subagent`/`get_subagent_result` too. `@` completes live agents, resumable ones, and startable types alongside pi's file completion; `@main` forces text back to the main model. Toggle via `/agents → Settings → Agent mentions`
 - **Scripted workflows** — a `SubagentWorkflow` tool that runs a deterministic JavaScript script orchestrating many subagents: `agent()`, `parallel()`, `pipeline()`, `phase()`, `log()` and `args`, with a pure-literal `meta` block declaring the phases. `pipeline()` has no barrier between stages, so one item can be in a later stage while another is still in the first — unlike `parallel()`, which idles every fast agent until the slowest finishes. Runs in the background with a live card, inspectable via `/agents → Workflows` or by selecting the run in FleetView. `agent()` also takes `gate: "npm test"` to verify a child by running a command (inside its worktree, when isolated) rather than asking another model, and `resume: "<label>"` to continue a child instead of re-paying its context. Scripts run in a `node:vm` sandbox on a worker thread where `Date.now()`, `Math.random()` and `eval` throw. On by default, but it stands down for company: if another extension already provides a `Workflow` or `SubagentWorkflow` tool, this one warns and disables itself for the session rather than offering the model two orchestrators. Pin it either way with `"workflowsEnabled"` in `subagents.json` or `/agents → Settings → Workflows`. A script written for Claude Code's `Workflow` tool runs here unchanged: same globals, `schema` returns a validated object exactly as it does there, `budget` is present and always reports no token target (pi has no such directive) so its `budget.total`-guarded patterns still take the branch they were written for, and nested `workflow()` composes saved workflows one level deep. **[Full guide](https://github.com/tintinweb/pi-subagents/blob/master/docs/workflows.md)**
 - **Mid-run steering** — inject messages into running agents to redirect their work without restarting
@@ -86,7 +86,7 @@ Press `ctrl+b` while a foreground `Agent` call is running to hand it to the back
 - `ctrl+b` hands off every running foreground `Agent` call at once. To hand off just one, press `b` in its conversation viewer (FleetView or `/agents → Running agents`).
 - The key is claimed only while such a call is running and the prompt editor has focus; the rest of the time — and in dialogs or the viewer's steering composer — `ctrl+b` is still pi's cursor-left. With FleetView disabled the extension cannot see which component has focus, so it claims the key whenever a call is running.
 - One hint shows per batch of parallel calls, on the earliest one still running.
-- Esc in the parent no longer reaches a handed-off agent. Stop it from `/agents → Running agents` with `x`.
+- Esc in the parent no longer reaches a handed-off agent. Stop it from `/agents → Running agents` with `x`, or let the model call `stop_subagent`.
 - It is one-way: there is no way back to foreground.
 - Other tool calls in the same assistant message still hold the model's next turn until they finish; pi runs a message's tool calls as one batch.
 - Not offered for a foreground call still queued for a slot, a foreground `resume`, a workflow's agents or nested children. There is no automatic timeout.
@@ -253,10 +253,10 @@ Individual agent results render Claude Code-style in the conversation:
 |-------|---------|
 | **Running** | `⠹ ↻3≤30 · 3 tool uses · 12.4k token (8%)` / `⎿ searching, reading 3 files…` |
 | **Completed** | `✓ ↻8 · 5 tool uses · 33.8k token (62%) · 12.3s` / `⎿ Done` |
-| **Wrapped up** | `✓ ↻50≤50 · 50 tool uses · 89.1k token (84% · ⇊2) · 45.2s` / `⎿ Wrapped up (turn limit)` |
+| **Wrapped up** | `✓ ↻50≤50 · 50 tool uses · 89.1k token (84% · ⇊2) · 45.2s` / `⎿ Wrapped up (turn limit)` or `(time limit)` |
 | **Stopped** | `■ ↻3 · 3 tool uses · 12.4k token (8%)` / `⎿ Stopped` |
 | **Error** | `✗ ↻3 · 3 tool uses · 12.4k token (8%)` / `⎿ Error: timeout` |
-| **Aborted** | `✗ ↻55≤50 · 55 tool uses · 102.3k token (95% · ⇊3)` / `⎿ Aborted (max turns exceeded)` |
+| **Aborted** | `✗ ↻55≤50 · 55 tool uses · 102.3k token (95% · ⇊3)` / `⎿ Aborted (turn limit exceeded)` or `(time limit exceeded)` |
 
 Completed results can be expanded (ctrl+o in pi) to show the full agent output inline.
 
@@ -350,7 +350,7 @@ All fields are optional — sensible defaults for everything.
 | `persist_session` | `subagents.json` `rememberAgents` (default `true`) | Persist this subagent as a normal pi session instead of keeping the session in memory only; overrides the `rememberAgents` project default in both directions. It records its spawning session as parent, so it nests under it in `/resume`. The subagent's `.output` transcript is still written either way unless `output_transcript: false` |
 | `output_transcript` | `true` (or `subagents.json` `outputTranscript`) | Write this subagent's `.output` transcript; when set, overrides the `subagents.json` `outputTranscript` default. Set `false` to write no transcript file or path. Governs only the transcript — independent of `persist_session`, `isolation: worktree`, and `memory:` |
 | `session_dir` | pi default | Optional session directory when `persist_session: true`; omitted uses pi's normal session location, and relative paths resolve from the agent cwd. A session outside the parent's session directory (this override, or `isolation: worktree`) is listed separately, so it shows as a root instead of nesting |
-| `allowed_subagents` | none | Opt in to scoped nested `Agent`, `get_subagent_result`, and `steer_subagent` tools. Omitted / empty / `none` / `false` = no nesting; `all` (or `"*"` / `true`) = any enabled agent; comma-separated list = only those agent types |
+| `allowed_subagents` | none | Opt in to scoped nested `Agent`, `get_subagent_result`, `steer_subagent`, and `stop_subagent` tools. Omitted / empty / `none` / `false` = no nesting; `all` (or `"*"` / `true`) = any enabled agent; comma-separated list = only those agent types |
 | `prompt_mode` | `replace` | `replace`: body is the full system prompt (no AGENTS.md / CLAUDE.md inheritance). `append`: body appended to parent's prompt (agent acts as a "parent twin" — inherits parent's AGENTS.md / CLAUDE.md) |
 | `inherit_context` | `false` | Pass the active parent conversation as text, with compaction applied |
 | `run_in_background` | — | Pin this agent to background (`true`) or foreground (`false`). Omit to follow `backgroundByDefault` |
@@ -483,11 +483,12 @@ Launch a sub-agent.
 |-----------|------|----------|-------------|
 | `prompt` | string | yes | The task for the agent |
 | `description` | string | yes | Short 3-5 word summary (shown in UI) |
-| `name` | string | no | Memorable name for this agent (`auth-audit`), addressable as `@name` and accepted by `steer_subagent`/`get_subagent_result`. Additive — the type-derived handle is still assigned |
+| `name` | string | no | Memorable name for this agent (`auth-audit`), addressable as `@name` and accepted by `steer_subagent`/`stop_subagent`/`get_subagent_result`. Additive — the type-derived handle is still assigned |
 | `subagent_type` | string | yes | Agent type (built-in or custom) |
 | `model` | string | no | Model — `provider/modelId` or fuzzy name (`"haiku"`, `"sonnet"`). Resolved tolerantly (`.`/`-` and a trailing date stamp interchangeable) with provider fallback |
 | `thinking` | string | no | Thinking level: off, minimal, low, medium, high, xhigh, max (availability depends on pi version and model) |
 | `max_turns` | number | no | Max agentic turns. Omit for unlimited (default) |
+| `max_minutes` | number | no | Wall-clock limit in minutes — see [Graceful limits](#graceful-limits). Omit for no limit (default). A resume without one keeps the limit the agent was spawned with. Not accepted with `schedule` |
 | `run_in_background` | boolean | no | Defaults to `true`; `false` blocks and returns the result inline, until [`ctrl+b`](#sending-a-foreground-agent-to-the-background) hands it to the background |
 | `resume` | string | no | Agent ID or handle to resume a previous session, including a persisted session whose in-memory record was evicted. Each resumed run gets a fresh `max_turns` budget |
 | `isolated` | boolean | no | No extension/MCP tools |
@@ -535,15 +536,18 @@ Concurrency is capped at `max(1, min(16, cpus - 2))` — the run's own limit, in
 
 ### `get_subagent_result`
 
-Check status and retrieve results from a background agent.
+Check status and retrieve results from a background agent, or list every agent.
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
-| `agent_id` | string | yes | Agent ID to check |
+| `agent_id` | string | no | Agent ID or handle to check. Omit it to list every top-level agent: ID, handle and name, type, status, description, duration, tool uses, tokens, and whether a finished result is still unread |
 | `wait` | boolean | no | Wait for completion |
+| `timeout_ms` | integer | no | With `wait: true`, stop waiting after this many milliseconds (at most 3,600,000) and return the current status. Default: wait until the agent finishes |
 | `verbose` | boolean | no | Include full conversation log |
 
-Cancelling a `wait: true` call (for example, with `Esc`) stops only the wait. The background agent keeps running, and its completion notification still arrives normally.
+Cancelling a `wait: true` call (for example, with `Esc`) stops only the wait, and so does `timeout_ms`. The background agent keeps running, and its completion notification still arrives normally.
+
+The list covers records still in memory: running and queued agents, and finished ones for 10 minutes after they finish. Nested children appear only in their parent's own list.
 
 ### `steer_subagent`
 
@@ -553,6 +557,18 @@ Send a steering message to a running agent. The message interrupts after the cur
 |-----------|------|----------|-------------|
 | `agent_id` | string | yes | Agent ID to steer |
 | `message` | string | yes | Message to inject into agent conversation |
+
+### `stop_subagent`
+
+Stop a running or queued agent now and return its partial output.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `agent_id` | string | yes | Agent ID or handle to stop |
+
+The stop cancels the agent's current model call and sends an abort signal to its running tool, and it stops the agent's nested children with it. The record is `stopped` at once. The call returns when the run has unwound, with what the agent produced so far, and that result counts as read, so no completion notification follows. Cancelling the call (for example, with `Esc`) does not undo the stop: the result stays unread and its notification still delivers it. Until the run has unwound, `get_subagent_result` reports the agent as stopping, does not mark the result read, and `wait: true` waits for the partial output. The status note names the parent as the actor (`stopped by you with stop_subagent`), so a later `get_subagent_result` does not report it as a user's intervention.
+
+A tool that ignores its abort signal, or an extension whose `session_start` never returns, cannot hold the run: 5 seconds after any stop, the run settles without it. The deadline covers the agent's session setup and its run; a worktree copy that is still being made when the stop lands finishes first. That tool can still be running afterwards, so the run's worktree, if it has one, is kept rather than committed and removed, and the result names its path. A session given up on during `session_start` is shut down rather than kept. A resume is refused while the agent is still stopping, and while a stopped tool call has not returned; the stopped result stays as it was.
 
 ## Commands
 
@@ -617,7 +633,7 @@ Settings                                    ← max concurrency (background + fo
 - **Create new agent** — choose project/personal location, then manual wizard (step-by-step prompts for name, tools, model, thinking, system prompt) or AI-generated (describe what the agent should do and a sub-agent writes the `.md` file). Any name is allowed, including default agent names (overrides them)
 - **Settings** — configure max concurrency (background and foreground), default max turns, grace turns, and join mode at runtime
 
-## Graceful Max Turns
+## Graceful limits
 
 Instead of hard-aborting at the turn limit, agents get a graceful shutdown:
 
@@ -627,12 +643,14 @@ Instead of hard-aborting at the turn limit, agents get a graceful shutdown:
 
 A resumed agent gets a fresh budget: `max_turns` is counted from the resume prompt, resolved as for a spawn — the agent file's `max_turns`, else the resume call's, else the limit the agent was spawned with, else the default.
 
+`max_minutes` bounds wall-clock time the same way, for runs where one slow tool call makes a turn limit meaningless. At the limit the agent gets the same wrap-up steer, delivered after its current tool call; one minute later the run is aborted with whatever it produced. The limit counts from when the agent's session is ready to take its prompt, so session setup is not part of it, and a resume gets a fresh one — the resume call's `max_minutes`, else the one the agent was spawned with. It is a call parameter only: agent files and the project settings have no time limit. Whichever limit fires first decides the wording: `steered` and `aborted` say `turn limit` or `time limit`. Both limits use the stop deadline described under [`stop_subagent`](#stop_subagent), so a hard abort cannot be held up by a tool either.
+
 | Status | Meaning | Icon |
 |--------|---------|------|
 | `completed` | Finished naturally | `✓` green |
-| `steered` | Hit limit, wrapped up in time | `✓` yellow |
+| `steered` | Hit a limit, wrapped up in time | `✓` yellow |
 | `aborted` | Grace period exceeded | `✗` red |
-| `stopped` | User-initiated abort | `■` dim |
+| `stopped` | Stopped by the user, or by the calling agent with `stop_subagent` | `■` dim |
 
 ## Concurrency
 

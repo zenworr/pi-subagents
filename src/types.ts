@@ -160,6 +160,9 @@ export type MentionResolution =
 /** Which concurrency pool a run is charged to. */
 export type Pool = "background" | "foreground";
 
+/** The run limit that steered or aborted an agent: `max_turns` or `max_minutes`. */
+export type RunLimit = "turns" | "time";
+
 export interface AgentRecord {
   id: string;
   type: SubagentType;
@@ -179,6 +182,16 @@ export interface AgentRecord {
   alias?: string;
   description: string;
   status: "queued" | "running" | "completed" | "steered" | "aborted" | "stopped" | "error";
+  /** Which limit made the run "steered" or "aborted". */
+  limit?: RunLimit;
+  /** Set when the calling agent stopped this one with `stop_subagent`, rather than a person or a shutdown. */
+  stoppedByCaller?: boolean;
+  /**
+   * "stopped" but still unwinding: `abort()` sets the status at once, and the
+   * partial output lands when the run settles. Readers wait or hold off rather
+   * than consume a result that is not there yet.
+   */
+  stopping?: boolean;
   result?: string;
   error?: string;
   toolUses: number;
@@ -320,6 +333,7 @@ export interface AgentInvocation {
   /** The caller's `model` parameter, as written, when an agent file's pin won. */
   requestedModel?: string;
   maxTurns?: number;
+  maxMinutes?: number;
   isolated?: boolean;
   inheritContext?: boolean;
   runInBackground?: boolean;

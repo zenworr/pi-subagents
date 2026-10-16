@@ -9,7 +9,8 @@ import { truncateToWidth } from "@earendil-works/pi-tui";
 import { renderAgentName } from "../agent-color.js";
 import { type AgentManager, isTopLevelAgent } from "../agent-manager.js";
 import { getConfig } from "../agent-types.js";
-import type { AgentInvocation, SubagentType, WidgetMode } from "../types.js";
+import { limitName } from "../status-note.js";
+import type { AgentInvocation, RunLimit, SubagentType, WidgetMode } from "../types.js";
 import { getLifetimeCost, getLifetimeTotal, getSessionContextPercent, type LifetimeUsage, type SessionLike } from "../usage.js";
 
 // ---- Constants ----
@@ -71,6 +72,8 @@ export interface AgentDetails {
   tokens: string;
   durationMs: number;
   status: "queued" | "running" | "completed" | "steered" | "aborted" | "stopped" | "error" | "background";
+  /** Which limit made the run "steered" or "aborted". */
+  limit?: RunLimit;
   /** Human-readable description of what the agent is currently doing. */
   activity?: string;
   /** Current spinner frame index (for animated running indicator). */
@@ -372,7 +375,7 @@ export class AgentWidget {
   }
 
   /** Render a finished agent line. */
-  private renderFinishedLine(a: { id: string; type: SubagentType; status: string; description: string; toolUses: number; startedAt: number; completedAt?: number; error?: string; lifetimeUsage?: LifetimeUsage }, theme: Theme): string {
+  private renderFinishedLine(a: { id: string; type: SubagentType; status: string; description: string; toolUses: number; startedAt: number; completedAt?: number; limit?: RunLimit; error?: string; lifetimeUsage?: LifetimeUsage }, theme: Theme): string {
     const modeLabel = getPromptModeLabel(a.type);
     const duration = formatMs((a.completedAt ?? Date.now()) - a.startedAt);
 
@@ -383,7 +386,7 @@ export class AgentWidget {
       statusText = "";
     } else if (a.status === "steered") {
       icon = theme.fg("warning", "✓");
-      statusText = theme.fg("warning", " (turn limit)");
+      statusText = theme.fg("warning", ` (${limitName(a)})`);
     } else if (a.status === "stopped") {
       icon = theme.fg("dim", "■");
       statusText = theme.fg("dim", " stopped");

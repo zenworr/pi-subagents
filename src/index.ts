@@ -15,7 +15,7 @@ import { isAbsolute, join } from "node:path";
 import { defineTool, type ExtensionAPI, type ExtensionCommandContext, type ExtensionContext, getAgentDir, getSettingsListTheme } from "@earendil-works/pi-coding-agent";
 import { Container, isKeyRelease, Key, matchesKey, type ScrollViewScrollbar, type SettingItem, SettingsList, Spacer, Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
-import { abortable } from "./abortable.js";
+import { abortable, waitForRecord } from "./abortable.js";
 import { hasAgentBadge, renderAgentName } from "./agent-color.js";
 import { buildNewAgentFile, disableInContent, enableInContent, isEmptyStub, locateAgentFile, personalAgentsDir, projectAgentsDir, serializeAgentFile } from "./agent-file-toggle.js";
 import { AgentManager, isTopLevelAgent } from "./agent-manager.js";
@@ -38,8 +38,8 @@ import { getPackageAgentsGate, getPackageWorkflowsGate, invalidatePackageCache, 
 import { SubagentScheduler } from "./schedule.js";
 import { resolveStorePath, ScheduleStore } from "./schedule-store.js";
 import { applyAndEmitLoaded, type CompletionDeliveryMode, loadSettings, type SubagentsSettings, saveAndEmitChanged, type ToolDescriptionMode } from "./settings.js";
-import { getForegroundOutcomeNote, getStatusNote, partialOutputSuffix } from "./status-note.js";
-import { type AgentConfig, type AgentInvocation, type AgentMentionMode, type AgentRecord, type AgentTombstone, type JoinMode, type NotificationDetails, type SubagentType, type ViewerMarkdownMode, type WidgetMode } from "./types.js";
+import { getForegroundOutcomeNote, getStatusNote, limitName, partialOutputSuffix } from "./status-note.js";
+import { type AgentConfig, type AgentInvocation, type AgentMentionMode, type AgentRecord, type AgentTombstone, type JoinMode, type NotificationDetails, type RunLimit, type SubagentType, type ViewerMarkdownMode, type WidgetMode } from "./types.js";
 import { createMentionProvider, mentionRoster, type TypeInfo } from "./ui/agent-mention.js";
 import {
   type AgentActivity,
@@ -167,11 +167,11 @@ function createActivityTracker(maxTurns?: number, onStreamUpdate?: () => void) {
 const THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh", "max"] as const;
 
 /** Human-readable status label for agent completion. */
-function getStatusLabel(status: string, error?: string): string {
-  switch (status) {
-    case "error": return `Error: ${error ?? "unknown"}`;
-    case "aborted": return "Aborted (max turns exceeded)";
-    case "steered": return "Wrapped up (turn limit)";
+function getStatusLabel(record: AgentRecord): string {
+  switch (record.status) {
+    case "error": return `Error: ${record.error ?? "unknown"}`;
+    case "aborted": return `Aborted (${limitName(record)} exceeded)`;
+    case "steered": return `Wrapped up (${limitName(record)})`;
     case "stopped": return "Stopped";
     default: return "Done";
   }
@@ -179,7 +179,7 @@ function getStatusLabel(status: string, error?: string): string {
 
 /** Format a structured task notification matching Claude Code's <task-notification> XML. */
 function formatTaskNotification(record: AgentRecord, resultMaxLen: number, showCost = false): string {
-  const status = getStatusLabel(record.status, record.error);
+  const status = getStatusLabel(record);
   const durationMs = record.completedAt ? record.completedAt - record.startedAt : 0;
   const totalTokens = getLifetimeTotal(record.lifetimeUsage);
   const contextPercent = getSessionContextPercent(record.session);
@@ -202,7 +202,7 @@ function formatTaskNotification(record: AgentRecord, resultMaxLen: number, showC
     record.toolCallId ? `<tool-use-id>${escapeXml(record.toolCallId)}</tool-use-id>` : null,
     record.outputFile ? `<output-file>${escapeXml(record.outputFile)}</output-file>` : null,
     `<status>${escapeXml(status)}</status>`,
-    `<summary>Agent "${escapeXml(record.description)}" ${record.status}${getStatusNote(record.status)}</summary>`,
+    `<summary>Agent "${escapeXml(record.description)}" ${record.status}${getStatusNote(record)}</summary>`,
     `<result>${escapeXml(resultPreview)}</result>`,
     `<usage><total_tokens>${totalTokens}</total_tokens><tool_uses>${record.toolUses}</tool_uses>${ctxXml}${compactXml}${costXml}<duration_ms>${durationMs}</duration_ms></usage>`,
     `</task-notification>`,
@@ -212,7 +212,7 @@ function formatTaskNotification(record: AgentRecord, resultMaxLen: number, showC
 /** Build AgentDetails from a base + record-specific fields. */
 function buildDetails(
   base: Pick<AgentDetails, "displayName" | "description" | "subagentType" | "modelName" | "tags">,
-  record: { toolUses: number; startedAt: number; completedAt?: number; status: string; error?: string; id?: string; session?: any; lifetimeUsage: LifetimeUsage },
+  record: { toolUses: number; startedAt: number; completedAt?: number; status: string; limit?: RunLimit; error?: string; id?: string; session?: any; lifetimeUsage: LifetimeUsage },
   activity?: AgentActivity,
   overrides?: Partial<AgentDetails>,
 ): AgentDetails {
@@ -228,6 +228,7 @@ function buildDetails(
     maxTurns: activity?.maxTurns,
     durationMs: (record.completedAt ?? Date.now()) - record.startedAt,
     status: record.status as AgentDetails["status"],
+    limit: record.limit,
     agentId: record.id,
     error: record.error,
     ...overrides,
@@ -889,7 +890,7 @@ export default function (pi: ExtensionAPI) {
             // to consume, and its notification is still the caller's only
             // signal that it finished.
             if (!record || record.parentAgentId) return false;
-            if (record.status === "running" || record.status === "queued") return false;
+            if (record.status === "running" || record.status === "queued" || record.stopping) return false;
             record.resultConsumed = true;
             outbox.cancel(record.id);
             return true;
@@ -1457,7 +1458,7 @@ export default function (pi: ExtensionAPI) {
     ctx: ExtensionContext,
     existing: AgentRecord,
     prompt: string,
-    opts: { outputTranscript: boolean; maxTurns?: number; toolCallId?: string },
+    opts: { outputTranscript: boolean; maxTurns?: number; maxMinutes?: number; toolCallId?: string },
   ): Promise<AgentRecord | undefined> {
     const id = existing.id;
     const joinMode = resolveJoinMode(defaultJoinMode, true);
@@ -1491,6 +1492,7 @@ export default function (pi: ExtensionAPI) {
     const record = await manager.resume(id, prompt, undefined, {
       isBackground: true,
       maxTurns: opts.maxTurns,
+      maxMinutes: opts.maxMinutes,
       onTurnEnd: bgCallbacks.onTurnEnd,
       onToolActivity: bgCallbacks.onToolActivity,
       onAssistantUsage: bgCallbacks.onAssistantUsage,
@@ -1672,7 +1674,7 @@ Notes:
 - Parallel work: one message, multiple Agent calls — they run concurrently.
 - Subagents run in the background by default; you'll be notified when one completes. Pass run_in_background: false only when your very next action depends on the result and nothing else could usefully happen while it runs. Never fabricate or predict a pending agent's results — if the user asks before the notification arrives, say it's still running.
 - The result is not shown to the user — summarize it for them. Verify an agent's claimed code changes before reporting work done.
-- resume continues a previous agent by ID or handle, reopening its persisted session after cleanup or reload; steer_subagent messages a running one.${isolationCompactGuideline}`;
+- resume continues a previous agent by ID or handle, reopening its persisted session after cleanup or reload; steer_subagent messages a running one, stop_subagent ends one.${isolationCompactGuideline}`;
 
   const fullAgentToolDescription = `Launch a new agent to handle complex, multi-step tasks autonomously. Each agent type has specific capabilities and tools available to it.
 
@@ -1697,7 +1699,8 @@ If the target is already known, use a direct tool — \`read\` for a known path,
 - **Foreground vs background**: Pass \`run_in_background: false\` only when your very next action depends on the agent's result and nothing else could usefully happen while it runs — e.g., a research agent whose finding gates the edit you're about to make. Otherwise let it run in the background (the default) — this includes fire-and-forget work, independent investigations, and anything where the user might hand you something else in the meantime. Wanting the result "next" is not enough on its own.
 - **Don't race**: after launching a background agent, you know nothing about its results. Never fabricate or predict them in any format — not as prose, summary, or structured output. The completion notification arrives in a later turn; it is never something you write yourself. If the user asks before it lands, say the agent is still running — give status, not a guess.
 - Use resume with an agent ID or handle to continue a previous agent's work. Persisted sessions reopen after cleanup or reload. A new (non-resume) Agent call starts a fresh agent with no memory of prior runs, so the prompt must be self-contained.
-- Use steer_subagent to send mid-run messages to a running background agent.
+- Use steer_subagent to send mid-run messages to a running background agent, and stop_subagent to end one that is stuck, working on the wrong thing, or no longer needed — its partial output comes back. Call get_subagent_result without agent_id to list every agent, for example to find their IDs again.
+- Use max_minutes to bound how long an agent may run, the way max_turns bounds its turns.
 - Clearly tell the agent whether you expect it to write code or just to do research (search, file reads, etc.), since it is not aware of the user's intent.
 - If an agent's description says it should be used proactively, try to use it without the user having to ask for it first.
 - Use model to specify a different model (as "provider/modelId", or fuzzy e.g. "haiku", "sonnet").
@@ -1810,6 +1813,12 @@ Terse command-style prompts produce shallow, generic work.
         Type.Number({
           description: "Maximum number of agentic turns before stopping. Omit for unlimited (default).",
           minimum: 1,
+        }),
+      ),
+      max_minutes: Type.Optional(
+        Type.Number({
+          description: "Wall-clock limit in minutes. At the limit the agent is told to wrap up; one minute later it is stopped and its partial output returned. Omit for no limit (default).",
+          exclusiveMinimum: 0,
         }),
       ),
       run_in_background: Type.Optional(
@@ -1925,7 +1934,7 @@ Terse command-style prompts produce shallow, generic work.
             }
           }
         } else {
-          const doneText = isSteered ? "Wrapped up (turn limit)" : "Done";
+          const doneText = isSteered ? `Wrapped up (${limitName(details)})` : "Done";
           line += "\n" + theme.fg("dim", `  ⎿  ${doneText}`);
         }
         return new Text(line, 0, 0);
@@ -1945,14 +1954,14 @@ Terse command-style prompts produce shallow, generic work.
         return new Text(text, 0, 0);
       }
 
-      // ---- Error / Aborted (hard max_turns) ----
+      // ---- Error / Aborted (hard max_turns or max_minutes) ----
       const s = stats(details);
       let line = theme.fg("error", "✗") + (s ? " " + s : "");
 
       if (details.status === "error") {
         line += "\n" + theme.fg("error", `  ⎿  Error: ${details.error ?? "unknown"}`);
       } else {
-        line += "\n" + theme.fg("warning", "  ⎿  Aborted (max turns exceeded)");
+        line += "\n" + theme.fg("warning", `  ⎿  Aborted (${limitName(details)} exceeded)`);
       }
 
       return new Text(line, 0, 0);
@@ -2080,6 +2089,7 @@ Terse command-style prompts produce shallow, generic work.
         // Explicit value only — the default fallback would just add noise.
         // Normalize so `0` (unlimited) doesn't surface as a misleading "max turns: 0".
         maxTurns: normalizeMaxTurns(resolvedConfig.maxTurns),
+        maxMinutes: resolvedConfig.maxMinutes,
         isolated,
         inheritContext,
         runInBackground,
@@ -2135,6 +2145,9 @@ Terse command-style prompts produce shallow, generic work.
         }
         if (params.inherit_context) {
           return textResult("Cannot combine `schedule` with `inherit_context` — there is no parent conversation at fire time.");
+        }
+        if (params.max_minutes !== undefined) {
+          return textResult("Cannot combine `schedule` with `max_minutes` — scheduled jobs take no time limit.");
         }
         if (params.run_in_background === false) {
           return textResult("Cannot combine `schedule` with `run_in_background: false` — scheduled jobs always run in background.");
@@ -2196,6 +2209,7 @@ Terse command-style prompts produce shallow, generic work.
             resumeSessionFile: entry.sessionFile,
             model,
             maxTurns: effectiveMaxTurns,
+            maxMinutes: resolvedConfig.maxMinutes,
             isolated,
             thinkingLevel: thinking,
             invocation: agentInvocation,
@@ -2237,7 +2251,7 @@ Terse command-style prompts produce shallow, generic work.
               `Type: ${entry.type}\n` +
               (record.outputFile ? `Output file: ${record.outputFile}\n` : "") +
               `\nYou will be notified when this agent completes.\n` +
-              `Use get_subagent_result to retrieve full results, or steer_subagent to send it messages.`,
+              `Use get_subagent_result to retrieve full results, steer_subagent to send it messages, or stop_subagent to stop it.`,
               { ...detailBaseFor(record), toolUses: record.toolUses, tokens: "", durationMs: 0, status: "background" as const, agentId: id },
             );
           }
@@ -2270,6 +2284,17 @@ Terse command-style prompts produce shallow, generic work.
         if (!existing.session) {
           return textResult(`Agent "${params.resume}" has no active session to resume.`);
         }
+        if (existing.stopping) {
+          return textResult(
+            `Agent "${params.resume}" is still stopping. Resume it once its partial output has landed — get_subagent_result with wait: true waits for that.`,
+          );
+        }
+        if (existing.status !== "running" && existing.status !== "queued" && existing.session.isStreaming) {
+          return textResult(
+            `Agent "${params.resume}" was stopped while a tool call was running, and that call has not returned yet. ` +
+            "It can be resumed once it does; its stopped result is unchanged.",
+          );
+        }
         // Not `effectiveMaxTurns`: that was resolved for `subagent_type`, which
         // a resume ignores, so it may describe another agent.
         const resumeMaxTurns = resumeTurnLimit(existing, params.max_turns);
@@ -2288,13 +2313,14 @@ Terse command-style prompts produce shallow, generic work.
           if (existing.status === "running" || existing.status === "queued") {
             return textResult(
               `Agent "${params.resume}" is still ${existing.status} — it can only be resumed once its current run finishes.\n` +
-              `Use steer_subagent to send it a message mid-run, or get_subagent_result to wait for it.`,
+              `Use steer_subagent to send it a message mid-run, get_subagent_result to wait for it, or stop_subagent to stop it.`,
             );
           }
 
           const record = await startBackgroundResume(ctx, existing, params.prompt, {
             outputTranscript,
             maxTurns: resumeMaxTurns,
+            maxMinutes: resolvedConfig.maxMinutes,
             toolCallId,
           });
           if (!record) {
@@ -2309,7 +2335,7 @@ Terse command-style prompts produce shallow, generic work.
             (record.outputFile ? `Output file: ${record.outputFile}\n` : "") +
             (isQueued ? `Position: queued (max ${manager.getMaxConcurrent()} concurrent)\n` : "") +
             `\nYou will be notified when this agent completes.\n` +
-            `Use get_subagent_result to retrieve full results, or steer_subagent to send it messages.`,
+            `Use get_subagent_result to retrieve full results, steer_subagent to send it messages, or stop_subagent to stop it.`,
             { ...detailBaseFor(record), toolUses: record.toolUses, tokens: "", durationMs: 0, status: "background" as const, agentId: id },
           );
         }
@@ -2328,6 +2354,7 @@ Terse command-style prompts produce shallow, generic work.
         try {
           record = await manager.resume(existing.id, params.prompt, signal, {
             maxTurns: resumeMaxTurns,
+            maxMinutes: resolvedConfig.maxMinutes,
             onTurnEnd: resumeCallbacks.onTurnEnd,
             onToolActivity: resumeCallbacks.onToolActivity,
           });
@@ -2344,7 +2371,7 @@ Terse command-style prompts produce shallow, generic work.
         if (record.status === "error") {
           return textResult(`Agent failed: ${record.error}${partialOutputSuffix(record)}`, buildDetails(detailBaseFor(record), record, resumeState));
         }
-        const outcomeNote = getForegroundOutcomeNote(record.status);
+        const outcomeNote = getForegroundOutcomeNote(record);
         return textResult(
           `${record.result?.trim() || "No output."}${outcomeNote ? `\n\nResumed run${outcomeNote}.` : ""}`,
           buildDetails(detailBaseFor(record), record, resumeState),
@@ -2364,7 +2391,7 @@ Terse command-style prompts produce shallow, generic work.
           (record?.outputFile ? `Output file: ${record.outputFile}\n` : "") +
           (isQueued ? `Position: queued (max ${manager.getMaxConcurrent()} concurrent)\n` : "") +
           `\nYou will be notified when this agent completes.\n` +
-          `Use get_subagent_result to retrieve full results, or steer_subagent to send it messages.\n` +
+          `Use get_subagent_result to retrieve full results, steer_subagent to send it messages, or stop_subagent to stop it.\n` +
           `Do not duplicate this agent's work.`,
           { ...detailBaseFor(record), toolUses: 0, tokens: "", durationMs: 0, status: "background" as const, agentId: id },
         );
@@ -2395,6 +2422,7 @@ Terse command-style prompts produce shallow, generic work.
           name: params.name as string | undefined,
           model,
           maxTurns: effectiveMaxTurns,
+          maxMinutes: resolvedConfig.maxMinutes,
           isolated,
           inheritContext,
           thinkingLevel: thinking,
@@ -2547,6 +2575,7 @@ Terse command-style prompts produce shallow, generic work.
           name: params.name as string | undefined,
           model,
           maxTurns: effectiveMaxTurns,
+          maxMinutes: resolvedConfig.maxMinutes,
           isolated,
           inheritContext,
           thinkingLevel: thinking,
@@ -2616,7 +2645,7 @@ Terse command-style prompts produce shallow, generic work.
         if (costText) statsParts.push(costText);
       }
       return textResult(
-        `${fallbackNote}Agent completed in ${formatMs(durationMs)} (${statsParts.join(", ")})${getForegroundOutcomeNote(record.status)}.\n\n` +
+        `${fallbackNote}Agent completed in ${formatMs(durationMs)} (${statsParts.join(", ")})${getForegroundOutcomeNote(record)}.\n\n` +
         (record.result?.trim() || "No output."),
         details,
       );
@@ -3081,19 +3110,103 @@ Terse command-style prompts produce shallow, generic work.
 
   // ---- get_subagent_result tool ----
 
+  /** Longest `timeout_ms` a wait accepts: an hour, well inside Node's 32-bit timer range. */
+  const WAIT_TIMEOUT_MAX_MS = 3_600_000;
+
+  /** Header, stats and result of one agent — what `get_subagent_result` and `stop_subagent` return. */
+  const formatAgentReport = (record: AgentRecord, timedOut = false): string => {
+    const displayName = getDisplayName(record.type);
+    const duration = formatDuration(record.startedAt, record.completedAt);
+    const tokens = formatLifetimeTokens(record);
+    const contextPercent = getSessionContextPercent(record.session);
+    const statsParts = [`Tool uses: ${record.toolUses}`];
+    if (tokens) statsParts.push(tokens);
+    if (showCost) {
+      const costText = formatCost(getLifetimeCost(record.lifetimeUsage));
+      if (costText) statsParts.push(`Cost: ${costText}`);
+    }
+    if (contextPercent !== null) statsParts.push(`Context: ${Math.round(contextPercent)}%`);
+    if (record.compactionCount) statsParts.push(`Compactions: ${record.compactionCount}`);
+    statsParts.push(`Duration: ${duration}`);
+
+    let output =
+      `Agent: ${record.id}\n` +
+      `Type: ${displayName} | Status: ${record.status}${getStatusNote(record)} | ${statsParts.join(" | ")}\n` +
+      `Description: ${record.description}\n\n`;
+
+    if (record.stopping) {
+      output += "Agent is stopping; its partial output lands within seconds. Use wait: true to get it.";
+    } else if (record.status === "running" || record.status === "queued") {
+      output += timedOut
+        ? `Agent is still ${record.status}; the wait timed out. It keeps running — wait again, steer it, or stop it.`
+        : `Agent is still ${record.status}. Use wait: true or check back later.`;
+    } else if (record.status === "error") {
+      output += `Error: ${record.error}${partialOutputSuffix(record)}`;
+    } else {
+      output += record.result?.trim() || "No output.";
+    }
+    return output;
+  };
+
+  /** Mark a settled result as read, which suppresses its completion notification. */
+  const consumeResult = (record: AgentRecord): void => {
+    if (record.status === "running" || record.status === "queued" || record.stopping) return;
+    record.resultConsumed = true;
+    outbox.cancel(record.id);
+  };
+
+  /** One line per top-level agent, for `get_subagent_result` without an `agent_id`. */
+  const formatAgentList = (): string => {
+    const agents = manager.listAgents().filter(isTopLevelAgent);
+    if (agents.length === 0) return "No agents in this session.";
+    const lines = agents.map((record) => {
+      const names = [record.handle, record.alias].filter(Boolean).join(", ");
+      const parts = [
+        `${record.id}${names ? ` (${names})` : ""}`,
+        getDisplayName(record.type),
+        `${record.status}${record.status === "steered" || record.status === "aborted" ? ` (${limitName(record)})` : ""}`,
+        record.description,
+        formatDuration(record.startedAt, record.completedAt),
+        `${record.toolUses} tool ${record.toolUses === 1 ? "use" : "uses"}`,
+      ];
+      const tokens = formatLifetimeTokens(record);
+      if (tokens) parts.push(tokens);
+      if (showCost) {
+        const costText = formatCost(getLifetimeCost(record.lifetimeUsage));
+        if (costText) parts.push(costText);
+      }
+      if (record.status !== "running" && record.status !== "queued" && !record.resultConsumed) parts.push("result not read yet");
+      return `- ${parts.join(" · ")}`;
+    });
+    return (
+      "Agents in this session, newest first (finished agents drop off 10 minutes after they finish):\n" +
+      lines.join("\n")
+    );
+  };
+
   registerToolReportingUsage(defineTool({
     name: SUBAGENT_TOOL_NAMES.GET_RESULT,
     label: "Get Agent Result",
     description:
-      "Check status and retrieve a background agent's full result — its completion notification carries only a preview. Use the agent ID returned by Agent.",
-    promptSnippet: "Check status and retrieve results from a background agent",
+      "Check status and retrieve a background agent's full result — its completion notification carries only a preview. " +
+      "Use the agent ID returned by Agent. Omit agent_id to list every agent in this session with its ID, status and usage.",
+    promptSnippet: "Check status and retrieve results from a background agent, or list all agents",
     parameters: Type.Object({
-      agent_id: Type.String({
-        description: "The agent ID to check. The agent's handle also works — its `name` if you gave it one, otherwise its type (`explore`, `explore-2`).",
-      }),
+      agent_id: Type.Optional(
+        Type.String({
+          description: "The agent ID to check. The agent's handle also works — its `name` if you gave it one, otherwise its type (`explore`, `explore-2`). Omit to list all agents.",
+        }),
+      ),
       wait: Type.Optional(
         Type.Boolean({
           description: "If true, wait for the agent to complete before returning. Default: false.",
+        }),
+      ),
+      timeout_ms: Type.Optional(
+        Type.Integer({
+          description: "With wait: true, stop waiting after this many milliseconds (at most 3600000) and return the current status. The agent keeps running. Default: wait until it completes.",
+          minimum: 0,
+          maximum: WAIT_TIMEOUT_MAX_MS,
         }),
       ),
       verbose: Type.Optional(
@@ -3103,58 +3216,22 @@ Terse command-style prompts produce shallow, generic work.
       ),
     }),
     execute: async (_toolCallId, params, signal, _onUpdate, _ctx) => {
+      if (params.agent_id === undefined) return textResult(formatAgentList());
+
       const record = resolveAgentRef(params.agent_id);
       if (!record || !isTopLevelAgent(record)) {
         return textResult(`Agent not found: "${params.agent_id}". It may have been cleaned up.`);
       }
 
-      // Wait for completion if requested. Cancellation stops only this tool
-      // call; the background agent keeps running and remains unconsumed so its
-      // completion notification can still be delivered.
-      // Queued agents have no promise yet (it's created when the queue starts
-      // them), so poll until they leave the queue, then await like a running one.
-      if (params.wait && (record.status === "running" || record.status === "queued")) {
-        while (record.status === "queued") {
-          await abortable(
-            new Promise<void>((resolve) => setTimeout(resolve, QUEUE_WAIT_POLL_MS)),
-            signal,
-          );
-        }
-        if (record.promise) await abortable(record.promise, signal);
-      }
+      // Wait for completion if requested. Cancellation and the timeout stop
+      // only this tool call; the background agent keeps running and remains
+      // unconsumed so its completion notification can still be delivered.
+      const timedOut = params.wait && (record.status === "running" || record.status === "queued" || record.stopping)
+        ? await waitForRecord(record, () => manager.awaitStartup(record.id), signal, params.timeout_ms, QUEUE_WAIT_POLL_MS)
+        : false;
 
-      const displayName = getDisplayName(record.type);
-      const duration = formatDuration(record.startedAt, record.completedAt);
-      const tokens = formatLifetimeTokens(record);
-      const contextPercent = getSessionContextPercent(record.session);
-      const statsParts = [`Tool uses: ${record.toolUses}`];
-      if (tokens) statsParts.push(tokens);
-      if (showCost) {
-        const costText = formatCost(getLifetimeCost(record.lifetimeUsage));
-        if (costText) statsParts.push(`Cost: ${costText}`);
-      }
-      if (contextPercent !== null) statsParts.push(`Context: ${Math.round(contextPercent)}%`);
-      if (record.compactionCount) statsParts.push(`Compactions: ${record.compactionCount}`);
-      statsParts.push(`Duration: ${duration}`);
-
-      let output =
-        `Agent: ${record.id}\n` +
-        `Type: ${displayName} | Status: ${record.status}${getStatusNote(record.status)} | ${statsParts.join(" | ")}\n` +
-        `Description: ${record.description}\n\n`;
-
-      if (record.status === "running") {
-        output += "Agent is still running. Use wait: true or check back later.";
-      } else if (record.status === "error") {
-        output += `Error: ${record.error}${partialOutputSuffix(record)}`;
-      } else {
-        output += record.result?.trim() || "No output.";
-      }
-
-      // Mark result as consumed — suppresses the completion notification
-      if (record.status !== "running" && record.status !== "queued") {
-        record.resultConsumed = true;
-        outbox.cancel(record.id);
-      }
+      let output = formatAgentReport(record, timedOut);
+      consumeResult(record);
 
       // Verbose: include full conversation
       if (params.verbose && record.session) {
@@ -3164,6 +3241,44 @@ Terse command-style prompts produce shallow, generic work.
         }
       }
 
+      return textResult(output);
+    },
+  }));
+
+  // ---- stop_subagent tool ----
+
+  registerToolReportingUsage(defineTool({
+    name: SUBAGENT_TOOL_NAMES.STOP,
+    label: "Stop Agent",
+    description:
+      "Stop a running or queued agent now. Its current model call is cancelled and its running tool is sent an abort, and the result returns what it produced so far. " +
+      "Use it when an agent works on the wrong thing, is stuck, or is no longer needed. To change its direction instead, use steer_subagent.",
+    promptSnippet: "Stop a running agent immediately and get its partial output",
+    parameters: Type.Object({
+      agent_id: Type.String({
+        description: "The agent ID to stop. The agent's handle also works — its `name` if you gave it one, otherwise its type (`explore`, `explore-2`).",
+      }),
+    }),
+    execute: async (_toolCallId, params, signal, _onUpdate, _ctx) => {
+      const record = resolveAgentRef(params.agent_id);
+      if (!record || !isTopLevelAgent(record)) {
+        return textResult(`Agent not found: "${params.agent_id}". It may have been cleaned up.`);
+      }
+      if (record.status !== "running" && record.status !== "queued") {
+        return textResult(`Agent "${params.agent_id}" is not running (status: ${record.status}). Nothing to stop.`);
+      }
+      // Before abort(), so every report of this stop — including a
+      // notification built while the run settles — names the right actor.
+      record.stoppedByCaller = true;
+      manager.abort(record.id);
+      // The record is "stopped" at once. Its partial output lands when the run
+      // has unwound, which the runner bounds at STOP_SETTLE_TIMEOUT_MS (a
+      // worktree is committed after that). Cancelling this call rejects here and
+      // leaves the result unread, so its notification still delivers it.
+      await abortable(manager.awaitStartup(record.id).catch(() => {}), signal);
+      if (record.promise) await abortable(record.promise, signal);
+      const output = formatAgentReport(record);
+      consumeResult(record);
       return textResult(output);
     },
   }));

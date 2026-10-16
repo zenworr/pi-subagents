@@ -7,7 +7,7 @@ import {
   type ToolDefinition,
 } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
-import { abortable } from "./abortable.js";
+import { abortable, waitForRecord } from "./abortable.js";
 import {
   buildAgentRegistry,
   getAgentConfigIn,
@@ -47,12 +47,13 @@ let maxSubagentDepth = 2;
 export function getMaxSubagentDepth(): number { return maxSubagentDepth; }
 export function setMaxSubagentDepth(n: number): void { maxSubagentDepth = Math.max(0, Math.floor(n)); }
 
-const NESTED_TOOL_NAMES = ["Agent", "get_subagent_result", "steer_subagent"] as const;
+const NESTED_TOOL_NAMES = ["Agent", "get_subagent_result", "steer_subagent", "stop_subagent"] as const;
 
 interface NestedSpawnOptions {
   description: string;
   model?: Model<any>;
   maxTurns?: number;
+  maxMinutes?: number;
   isolated?: boolean;
   inheritContext?: boolean;
   thinkingLevel?: ThinkingLevel;
@@ -89,7 +90,9 @@ export interface NestedAgentManager {
     onSpawned?: (id: string) => void,
   ): Promise<{ id: string; record: AgentRecord }>;
   getRecord(id: string): AgentRecord | undefined;
-  resume(id: string, prompt: string, signal?: AbortSignal, options?: { maxTurns?: number }): Promise<AgentRecord | undefined>;
+  listAgents(): AgentRecord[];
+  abort(id: string): boolean;
+  resume(id: string, prompt: string, signal?: AbortSignal, options?: { maxTurns?: number; maxMinutes?: number }): Promise<AgentRecord | undefined>;
 }
 
 export interface NestedToolContext {
@@ -132,13 +135,14 @@ function formatRecord(record: AgentRecord, position: ResultPosition): string {
   if (record.status === "queued" || record.status === "running") {
     return `Agent ${record.id} is ${record.status}.`;
   }
+  if (record.stopping) return `Agent ${record.id} is stopping; its partial output lands within seconds.`;
   // A truncated run must not read as a finished one. The top-level path carries
   // this in its result headline; a nested result has no headline, so the note
   // leads — appended, it would look like part of the child's own output.
   const text = record.result?.trim() || record.error?.trim() || "No output.";
   const note = position === "inline"
-    ? getForegroundOutcomeNote(record.status)
-    : getStatusNote(record.status);
+    ? getForegroundOutcomeNote(record)
+    : getStatusNote(record);
   return note ? `Nested agent${note}.\n\n${text}` : text;
 }
 
@@ -170,6 +174,10 @@ export function createNestedSubagentTools(context: NestedToolContext): ToolDefin
       model: Type.Optional(Type.String({ description: "Optional provider/model override." })),
       thinking: Type.Optional(Type.String({ description: "Optional thinking level." })),
       max_turns: Type.Optional(Type.Number({ minimum: 1 })),
+      max_minutes: Type.Optional(Type.Number({
+        description: "Wall-clock limit in minutes: told to wrap up at the limit, stopped one minute later.",
+        exclusiveMinimum: 0,
+      })),
       run_in_background: Type.Optional(
         Type.Boolean({
           description: "Defaults to false for nested spawns — the call blocks and returns the child's result inline. Set true only for work you will collect later with get_subagent_result; a detached child is stopped when you finish.",
@@ -190,6 +198,7 @@ export function createNestedSubagentTools(context: NestedToolContext): ToolDefin
         // back to the limit the child was spawned with, then the default.
         const resumed = await context.manager.resume(params.resume, params.prompt, signal, {
           maxTurns: getAgentConfigIn(loadRegistry(), existing.type)?.maxTurns ?? params.max_turns,
+          maxMinutes: params.max_minutes,
         });
         return resumed
           ? textResult(formatRecord(resumed, "inline"), resumed.status === "error")
@@ -263,6 +272,7 @@ export function createNestedSubagentTools(context: NestedToolContext): ToolDefin
         description: params.description,
         model,
         maxTurns: invocation.maxTurns,
+        maxMinutes: invocation.maxMinutes,
         isolated: invocation.isolated,
         inheritContext: invocation.inheritContext,
         thinkingLevel: invocation.thinking,
@@ -270,6 +280,7 @@ export function createNestedSubagentTools(context: NestedToolContext): ToolDefin
         invocation: {
           thinking: invocation.thinking,
           maxTurns: invocation.maxTurns,
+          maxMinutes: invocation.maxMinutes,
           isolated: invocation.isolated,
           inheritContext: invocation.inheritContext,
           runInBackground: invocation.runInBackground,
@@ -369,25 +380,32 @@ export function createNestedSubagentTools(context: NestedToolContext): ToolDefin
   const resultTool = defineTool({
     name: NESTED_TOOL_NAMES[1],
     label: "Get Nested Agent Result",
-    description: "Check or wait for a background nested agent owned by this parent.",
+    description: "Check or wait for a background nested agent owned by this parent. Omit agent_id to list them all.",
     parameters: Type.Object({
-      agent_id: Type.String(),
+      agent_id: Type.Optional(Type.String()),
       wait: Type.Optional(Type.Boolean()),
+      timeout_ms: Type.Optional(Type.Integer({
+        description: "With wait: true, stop waiting after this many milliseconds (at most 3600000). The agent keeps running.",
+        minimum: 0,
+        maximum: 3_600_000,
+      })),
     }),
     execute: async (_toolCallId, params, signal) => {
+      if (params.agent_id === undefined) {
+        const owned = context.manager.listAgents().filter(r => ownsRecord(r, context.parentAgentId));
+        return textResult(owned.length === 0
+          ? "No nested agents."
+          : owned.map(r => `- ${r.id} · ${r.type} · ${r.status} · ${r.description}`).join("\n"));
+      }
       const record = context.manager.getRecord(params.agent_id);
       if (!ownsRecord(record, context.parentAgentId)) {
         return textResult(`Nested agent not found or not owned by this parent: "${params.agent_id}".`, true);
       }
       // Wait for completion if requested. Cancellation (e.g. the parent's tool
-      // call is aborted) stops only this wait; the nested child keeps running and
-      // stays unconsumed. Queued records have no promise until the manager starts
-      // them, so poll — abortably — until they leave the queue, then await.
-      if (params.wait && (record.status === "queued" || record.status === "running")) {
-        while (record.status === "queued") {
-          await abortable(new Promise<void>(resolve => setTimeout(resolve, 250)), signal);
-        }
-        if (record.promise) await abortable(record.promise, signal);
+      // call is aborted) and the timeout stop only this wait; the nested child
+      // keeps running and stays unconsumed.
+      if (params.wait && (record.status === "queued" || record.status === "running" || record.stopping)) {
+        await waitForRecord(record, () => context.manager.awaitStartup(record.id), signal, params.timeout_ms, 250);
       }
       return textResult(formatRecord(record, "fetched"), record.status === "error");
     },
@@ -422,5 +440,25 @@ export function createNestedSubagentTools(context: NestedToolContext): ToolDefin
     },
   });
 
-  return [agentTool, resultTool, steerTool];
+  const stopTool = defineTool({
+    name: NESTED_TOOL_NAMES[3],
+    label: "Stop Nested Agent",
+    description: "Stop a running or queued nested agent owned by this parent now, and get its partial output.",
+    parameters: Type.Object({
+      agent_id: Type.String(),
+    }),
+    execute: async (_toolCallId, params, signal) => {
+      const record = context.manager.getRecord(params.agent_id);
+      if (!ownsRecord(record, context.parentAgentId) || (record.status !== "running" && record.status !== "queued")) {
+        return textResult(`Running nested agent not found or not owned by this parent: "${params.agent_id}".`, true);
+      }
+      record.stoppedByCaller = true;
+      context.manager.abort(record.id);
+      await abortable(context.manager.awaitStartup(record.id).catch(() => {}), signal);
+      if (record.promise) await abortable(record.promise, signal);
+      return textResult(formatRecord(record, "fetched"));
+    },
+  });
+
+  return [agentTool, resultTool, steerTool, stopTool];
 }

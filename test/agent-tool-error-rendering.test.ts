@@ -42,7 +42,7 @@ describe("Agent tool invocation error rendering", () => {
     });
 
     expect(output).toContain('Cannot run with isolation: "worktree" — Git probe failed.');
-    expect(output).not.toContain("Aborted (max turns exceeded)");
+    expect(output).not.toContain("Aborted (turn limit exceeded)");
   });
 
   it.each([
@@ -58,6 +58,6 @@ describe("Agent tool invocation error rendering", () => {
     });
 
     expect(output).toContain("Unstructured Agent result.");
-    expect(output).not.toContain("Aborted (max turns exceeded)");
+    expect(output).not.toContain("Aborted (turn limit exceeded)");
   });
 });

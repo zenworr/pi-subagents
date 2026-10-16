@@ -31,7 +31,7 @@ import { createNestedSubagentTools, getMaxSubagentDepth, type NestedAgentManager
 import { buildAgentPrompt, type PromptExtras } from "./prompts.js";
 import { preloadSkills } from "./skill-loader.js";
 import { createStructuredCapture, createStructuredOutputTool, structuredRetryPrompt } from "./structured-output.js";
-import type { SubagentType, ThinkingLevel } from "./types.js";
+import type { RunLimit, SubagentType, ThinkingLevel } from "./types.js";
 import type { LifetimeUsage } from "./usage.js";
 import type { CompiledSchema } from "./workflow/json-schema.js";
 
@@ -46,6 +46,7 @@ export const SUBAGENT_TOOL_NAMES = {
   WORKFLOW: "SubagentWorkflow",
   GET_RESULT: "get_subagent_result",
   STEER: "steer_subagent",
+  STOP: "stop_subagent",
 } as const;
 
 /** Names of tools registered by this extension that subagents must NOT inherit. */
@@ -412,6 +413,12 @@ export function getGraceTurns(): number { return graceTurns; }
 /** Set the grace turns value (minimum 1). */
 export function setGraceTurns(n: number): void { graceTurns = Math.max(1, n); }
 
+/** Time between the wrap-up steer at `maxMinutes` and the hard abort. */
+const TIME_LIMIT_GRACE_MS = 60_000;
+
+/** How long a stopped run may take to unwind before it is given up on. */
+export const STOP_SETTLE_TIMEOUT_MS = 5_000;
+
 /**
  * Try to find the right model for an agent type.
  * Priority: explicit option > config.model > parent model.
@@ -456,6 +463,8 @@ export interface RunOptions {
   agentId?: string;
   model?: Model<any>;
   maxTurns?: number;
+  /** Wall-clock limit for this run: steer to wrap up at the limit, hard-abort after a grace period. */
+  maxMinutes?: number;
   signal?: AbortSignal;
   /** Applies only when the agent file leaves `isolated:` unset — frontmatter is authoritative. */
   isolated?: boolean;
@@ -555,6 +564,19 @@ export interface RunResult {
   aborted: boolean;
   /** True if the agent was steered to wrap up (hit soft turn limit) but finished in time. */
   steered: boolean;
+  /** Which limit produced `steered` / `aborted`. */
+  limit?: RunLimit;
+  /**
+   * The run was given up on STOP_SETTLE_TIMEOUT_MS after a stop, with its
+   * prompt (or `session_start`) still in flight — a tool may still be working,
+   * so its worktree must not be cleaned up.
+   */
+  abandoned?: boolean;
+  /**
+   * Given up on during `bindExtensions`: the session never had its tool scope
+   * installed, so it must be torn down rather than kept for a resume.
+   */
+  unboundSession?: boolean;
   /**
    * A failure message for the run's FINAL assistant turn, when that turn failed:
    * a provider error (stopReason "error"), or a "length" stop that produced no
@@ -657,6 +679,7 @@ function finalTurnError(session: AgentSession, startIndex = 0): string | undefin
 type RunObserverOptions = Pick<RunOptions, "onTurnEnd" | "onTextDelta" | "onToolActivity" | "onAssistantUsage" | "onCompaction"> & {
   /** Already resolved: undefined = unlimited. */
   maxTurns?: number;
+  maxMinutes?: number;
 };
 
 /**
@@ -667,25 +690,45 @@ type RunObserverOptions = Pick<RunOptions, "onTurnEnd" | "onTextDelta" | "onTool
  * Shared by `runAgent` and `resumeAgent` so a resumed run is bounded exactly
  * like the first one (#368).
  */
-function observeRun(session: AgentSession, options: RunObserverOptions) {
+function observeRun(session: AgentSession, options: RunObserverOptions, stopper: Stopper) {
   let turnCount = 0;
   let currentMessageText = "";
+  const timers: ReturnType<typeof setTimeout>[] = [];
+  const after = (ms: number, fn: () => void) => { timers.push(setTimeout(fn, ms).unref()); };
   const run = {
     steered: false,
     aborted: false,
+    /** The first limit to fire; a later one does not relabel the run. */
+    limit: undefined as RunLimit | undefined,
     unsubscribe: () => {},
   };
-  run.unsubscribe = session.subscribe((event: AgentSessionEvent) => {
+  const hardAbort = (limit: RunLimit) => {
+    if (run.aborted) return;
+    run.aborted = true;
+    run.limit ??= limit;
+    stopper.stop();
+  };
+  if (options.maxMinutes != null) {
+    after(options.maxMinutes * 60_000, () => {
+      if (!run.steered) {
+        run.steered = true;
+        run.limit = "time";
+        session.steer("You have reached your time limit. Wrap up immediately — provide your final answer now.").catch(() => {});
+      }
+      after(TIME_LIMIT_GRACE_MS, () => hardAbort("time"));
+    });
+  }
+  const unsubscribe = session.subscribe((event: AgentSessionEvent) => {
     if (event.type === "turn_end") {
       turnCount++;
       options.onTurnEnd?.(turnCount);
       if (options.maxTurns != null) {
         if (!run.steered && turnCount >= options.maxTurns) {
           run.steered = true;
+          run.limit = "turns";
           session.steer("You have reached your turn limit. Wrap up immediately — provide your final answer now.");
         } else if (run.steered && turnCount >= options.maxTurns + graceTurns) {
-          run.aborted = true;
-          session.abort();
+          hardAbort("turns");
         }
       }
     }
@@ -716,16 +759,49 @@ function observeRun(session: AgentSession, options: RunObserverOptions) {
       options.onCompaction?.({ reason: event.reason, tokensBefore: event.result.tokensBefore });
     }
   });
+  run.unsubscribe = () => {
+    unsubscribe();
+    for (const timer of timers) clearTimeout(timer);
+  };
   return run;
 }
 
+/** What `Stopper.within` resolves to when the run was given up on first. */
+const GAVE_UP = Symbol("gave-up");
+
 /**
- * Wire an AbortSignal to abort a session.
- * Returns a cleanup function to remove the listener.
+ * The stop half of one run: abort the session, and give up on the run
+ * STOP_SETTLE_TIMEOUT_MS later if it has not unwound by then. A tool that
+ * ignores its abort signal, or a `session_start` handler that never returns,
+ * would otherwise hold the record at "running" forever, with nothing able to
+ * stop, resume or wait on it (#318).
  */
-function forwardAbortSignal(session: AgentSession, signal?: AbortSignal): () => void {
+function createStopper() {
+  let session: AgentSession | undefined;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  let giveUp = () => {};
+  const gaveUp = new Promise<typeof GAVE_UP>(resolve => { giveUp = () => resolve(GAVE_UP); });
+  return {
+    stop(): void {
+      void session?.abort();
+      timer ??= setTimeout(giveUp, STOP_SETTLE_TIMEOUT_MS).unref();
+    },
+    attach(s: AgentSession): void { session = s; },
+    /** `work`'s value, or GAVE_UP when the run is given up on first. */
+    within<T>(work: Promise<T>): Promise<T | typeof GAVE_UP> { return Promise.race([work, gaveUp]); },
+    dispose(): void { clearTimeout(timer); },
+  };
+}
+type Stopper = ReturnType<typeof createStopper>;
+
+const stoppedDuringStartup = () => new Error("stopped before its session finished starting");
+
+/** Stop the run when `signal` aborts. Returns a cleanup function to remove the listener. */
+function forwardAbortSignal(stopper: Stopper, signal?: AbortSignal): () => void {
   if (!signal) return () => {};
-  const onAbort = () => session.abort();
+  // `addEventListener` never fires for a signal that is already aborted.
+  if (signal.aborted) stopper.stop();
+  const onAbort = () => stopper.stop();
   signal.addEventListener("abort", onAbort, { once: true });
   return () => signal.removeEventListener("abort", onAbort);
 }
@@ -743,6 +819,24 @@ export async function runAgent(
   prompt: string,
   options: RunOptions,
 ): Promise<RunResult> {
+  // Armed before any setup, so a stop is bounded from the first await on.
+  const stopper = createStopper();
+  const cleanupAbort = forwardAbortSignal(stopper, options.signal);
+  try {
+    return await startAndRunAgent(stopper, ctx, type, prompt, options);
+  } finally {
+    cleanupAbort();
+    stopper.dispose();
+  }
+}
+
+async function startAndRunAgent(
+  stopper: Stopper,
+  ctx: ExtensionContext,
+  type: SubagentType,
+  prompt: string,
+  options: RunOptions,
+): Promise<RunResult> {
   const config = getConfig(type);
   const agentConfig = getAgentConfig(type);
 
@@ -752,7 +846,8 @@ export async function runAgent(
   // They differ only for SpawnOptions.cwd spawns (config stays with the parent).
   const configCwd = options.configCwd ?? effectiveCwd;
 
-  const env = await detectEnv(options.pi, effectiveCwd);
+  const env = await stopper.within(detectEnv(options.pi, effectiveCwd));
+  if (env === GAVE_UP) throw stoppedDuringStartup();
 
   // Get parent system prompt for append-mode agents
   const parentSystemPrompt = ctx.getSystemPrompt();
@@ -930,7 +1025,7 @@ export async function runAgent(
     systemPromptOverride: () => systemPrompt,
     appendSystemPromptOverride: () => [],
   });
-  await runInChildSessionContext(() => loader.reload());
+  if (await stopper.within(runInChildSessionContext(() => loader.reload())) === GAVE_UP) throw stoppedDuringStartup();
 
   // Plain entries in `tools:` are expected to be built-in names (extension tools
   // go through `ext:`), so an unknown name there is unambiguously a typo. Previously
@@ -1178,7 +1273,15 @@ export async function runAgent(
     sessionOpts.thinkingLevel = thinkingLevel;
   }
 
-  const { session } = await runInChildSessionContext(() => createAgentSession(sessionOpts));
+  const creating = runInChildSessionContext(() => createAgentSession(sessionOpts));
+  const created = await stopper.within(creating);
+  if (created === GAVE_UP) {
+    // Not bound yet, so no `session_start` ran and a plain dispose is the whole teardown.
+    creating.then(({ session }) => session.dispose(), () => {});
+    throw stoppedDuringStartup();
+  }
+  const { session } = created;
+  stopper.attach(session);
 
   const baseSessionName = agentConfig?.name ?? type;
   session.setSessionName(
@@ -1189,14 +1292,19 @@ export async function runAgent(
   // (e.g. loading credentials, setting up state). Tool gating already happened
   // at session construction via the `tools:` allowlist above — no separate
   // post-bind filter is needed. All ExtensionBindings fields are optional.
-  await session.bindExtensions({
+  const bound = await stopper.within(session.bindExtensions({
     onError: (err) => {
       options.onToolActivity?.({
         type: "end",
         toolName: `extension-error:${err.extensionPath}`,
       });
     },
-  });
+  }));
+  // Returned rather than thrown: `session_start` handlers have run or are
+  // running, so the session must reach the manager, whose teardown emits
+  // `session_shutdown` (#242). The tool scope below is never installed, so the
+  // manager must not keep it for a resume either.
+  if (bound === GAVE_UP) return { responseText: "", session, aborted: false, steered: false, abandoned: true, unboundSession: true };
 
   // With `allowedToolNames` unset, the registry is scoped by `excludeTools` but
   // the ACTIVE set still needs managing: pi activates only its four default
@@ -1218,10 +1326,9 @@ export async function runAgent(
 
   options.onSessionCreated?.(session);
 
-  const run = observeRun(session, { ...options, maxTurns: resolveEffectiveMaxTurns(type, options.maxTurns) });
+  const run = observeRun(session, { ...options, maxTurns: resolveEffectiveMaxTurns(type, options.maxTurns) }, stopper);
 
   const collector = collectResponseText(session);
-  const cleanupAbort = forwardAbortSignal(session, options.signal);
 
   // Build the effective prompt: optionally prepend parent context
   let effectivePrompt = prompt;
@@ -1236,11 +1343,12 @@ export async function runAgent(
   // on counts as this run's output (a fresh session, so usually 0).
   const startLen = session.messages.length;
   let structuredRetried = false;
+  let abandoned = false;
   try {
     // A signal that fired before this point never calls the listener above, and
     // pi's `session.abort()` is a no-op until a run is active — so a child whose
     // parent is already gone is not prompted at all.
-    if (options.signal?.aborted !== true) await session.prompt(effectivePrompt);
+    if (options.signal?.aborted !== true) abandoned = await stopper.within(session.prompt(effectivePrompt)) === GAVE_UP;
 
     // One more prompt when a schema was asked for and nothing usable came back
     // — the model answered in prose, or only ever called the tool invalidly.
@@ -1250,12 +1358,11 @@ export async function runAgent(
     if (structuredCapture !== undefined && structuredCapture.json === undefined
       && !run.aborted && options.signal?.aborted !== true) {
       structuredRetried = true;
-      await session.prompt(structuredRetryPrompt(structuredCapture));
+      abandoned = await stopper.within(session.prompt(structuredRetryPrompt(structuredCapture))) === GAVE_UP;
     }
   } finally {
     run.unsubscribe();
     collector.unsubscribe();
-    cleanupAbort();
   }
 
   const responseText = collector.getText().trim() || getLastAssistantText(session, startLen);
@@ -1272,6 +1379,8 @@ export async function runAgent(
     session,
     aborted: run.aborted,
     steered: run.steered,
+    limit: run.limit,
+    ...(abandoned ? { abandoned } : {}),
     failure: finalTurnError(session, startLen) ?? structuredFailure,
     ...(structuredCapture?.json !== undefined ? { structuredJson: structuredCapture.json } : {}),
     ...(structuredRetried ? { structuredRetried } : {}),
@@ -1287,26 +1396,30 @@ export async function runAgent(
 export async function resumeAgent(
   session: AgentSession,
   prompt: string,
-  options: Pick<RunOptions, "maxTurns" | "onTurnEnd" | "onToolActivity" | "onAssistantUsage" | "onCompaction" | "signal"> & {
+  options: Pick<RunOptions, "maxTurns" | "maxMinutes" | "onTurnEnd" | "onToolActivity" | "onAssistantUsage" | "onCompaction" | "signal"> & {
     /** The agent's type, for its own `max_turns`. */
     type: SubagentType;
   },
-): Promise<{ text: string; failure?: string } & Pick<RunResult, "aborted" | "steered">> {
+): Promise<{ text: string; failure?: string } & Pick<RunResult, "aborted" | "steered" | "limit" | "abandoned">> {
   // Boundary for the history fallback: the session already holds prior turns,
   // so only assistant text produced by THIS resume prompt counts as its output
   // — a failed resume must not surface the previous turn's answer (#144).
   const startLen = session.messages.length;
   const collector = collectResponseText(session);
-  const cleanupAbort = forwardAbortSignal(session, options.signal);
-  const run = observeRun(session, { ...options, maxTurns: resolveEffectiveMaxTurns(options.type, options.maxTurns) });
+  const stopper = createStopper();
+  stopper.attach(session);
+  const run = observeRun(session, { ...options, maxTurns: resolveEffectiveMaxTurns(options.type, options.maxTurns) }, stopper);
+  const cleanupAbort = forwardAbortSignal(stopper, options.signal);
 
+  let abandoned = false;
   try {
     // Already aborted: not prompted, as in `runAgent`.
-    if (options.signal?.aborted !== true) await session.prompt(prompt);
+    if (options.signal?.aborted !== true) abandoned = await stopper.within(session.prompt(prompt)) === GAVE_UP;
   } finally {
     collector.unsubscribe();
     run.unsubscribe();
     cleanupAbort();
+    stopper.dispose();
   }
 
   return {
@@ -1314,6 +1427,8 @@ export async function resumeAgent(
     failure: finalTurnError(session, startLen),
     aborted: run.aborted,
     steered: run.steered,
+    limit: run.limit,
+    ...(abandoned ? { abandoned } : {}),
   };
 }
 
