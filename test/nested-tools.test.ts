@@ -80,6 +80,13 @@ beforeEach(() => {
     spawnAndWait,
     awaitStartup: vi.fn(async () => {}),
     getRecord: (id: string) => records.get(id),
+    listAgents: () => [...records.values()],
+    abort: vi.fn((id: string) => {
+      const record = records.get(id);
+      if (record?.status !== "running" && record?.status !== "queued") return false;
+      record.status = "stopped";
+      return true;
+    }),
     resume: vi.fn(),
   } as any;
 });
@@ -294,6 +301,43 @@ describe("child-safe nested Agent tools", () => {
     await execute(agent, { resume: "child-1", subagent_type: "scout", description: "continue", prompt: "Continue", max_turns: 3 });
 
     expect(manager.resume).toHaveBeenCalledWith("child-1", "Continue", undefined, expect.objectContaining({ maxTurns: 3 }));
+  });
+
+  it("stops an owned child and returns its partial output, and refuses a foreign one", async () => {
+    const [agent, , , stop] = tools(["scout"]);
+    await execute(agent, { subagent_type: "scout", description: "find files", prompt: "Find them", run_in_background: true });
+    records.get("child-1").result = "found two";
+    records.set("foreign", { id: "foreign", status: "running", parentAgentId: "other" });
+
+    const stopped = await execute(stop, { agent_id: "child-1" });
+    expect(stopped.isError).toBe(false);
+    expect(stopped.content[0].text).toContain("stopped by you with stop_subagent");
+    expect(stopped.content[0].text).toContain("found two");
+
+    expect((await execute(stop, { agent_id: "foreign" })).isError).toBe(true);
+    expect(records.get("foreign").status).toBe("running");
+  });
+
+  it("lists only the parent's own children when agent_id is omitted", async () => {
+    const [agent, getResult] = tools(["scout"]);
+    await execute(agent, { subagent_type: "scout", description: "find files", prompt: "Find them", run_in_background: true });
+    records.set("foreign", { id: "foreign", type: "scout", status: "running", description: "secret", parentAgentId: "other" });
+
+    const listed = (await execute(getResult, {})).content[0].text;
+
+    expect(listed).toContain("child-1");
+    expect(listed).not.toContain("foreign");
+  });
+
+  it("passes max_minutes through on a nested spawn and resume", async () => {
+    const [agent] = tools(["scout"]);
+    await execute(agent, { subagent_type: "scout", description: "find files", prompt: "Find them", run_in_background: true, max_minutes: 4 });
+    expect(spawn).toHaveBeenCalledWith(
+      expect.anything(), expect.anything(), "scout", "Find them", expect.objectContaining({ maxMinutes: 4 }),
+    );
+
+    await execute(agent, { resume: "child-1", subagent_type: "scout", description: "continue", prompt: "Continue", max_minutes: 2 });
+    expect(manager.resume).toHaveBeenCalledWith("child-1", "Continue", undefined, expect.objectContaining({ maxMinutes: 2 }));
   });
 
   it("reports a background child that fails to start as a tool error", async () => {

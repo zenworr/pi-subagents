@@ -197,6 +197,8 @@ interface SpawnOptions {
   reclaim?: { id?: string; handle: string; alias?: string };
   model?: Model<any>;
   maxTurns?: number;
+  /** Wall-clock limit for the run, in minutes. */
+  maxMinutes?: number;
   isolated?: boolean;
   inheritContext?: boolean;
   thinkingLevel?: ThinkingLevel;
@@ -320,6 +322,8 @@ interface ResumeOptions {
    * counted afresh from the resume prompt (#368).
    */
   maxTurns?: number;
+  /** Wall-clock limit for the resumed run, else the one the agent was spawned with. */
+  maxMinutes?: number;
   /** Called at the end of each resumed turn with the count since the resume. */
   onTurnEnd?: (turnCount: number) => void;
   /** Called on tool start/end with activity info (for streaming progress to UI). */
@@ -800,6 +804,7 @@ export class AgentManager {
       agentId: id,
       model: options.model,
       maxTurns: options.maxTurns,
+      maxMinutes: options.maxMinutes,
       isolated: options.isolated,
       inheritContext: options.inheritContext,
       thinkingLevel: options.thinkingLevel,
@@ -883,14 +888,15 @@ export class AgentManager {
         options.onSessionCreated?.(session);
       },
     })
-      .then(async ({ responseText, session, aborted, steered, failure, structuredJson, structuredRetried }) => {
-        this.settleOutcome(record, { text: responseText, failure, aborted, steered });
+      .then(async ({ responseText, session, aborted, steered, limit, abandoned, unboundSession, failure, structuredJson, structuredRetried }) => {
+        this.settleOutcome(record, { text: responseText, failure, aborted, steered, limit });
         // Kept beside `result`, never inside it: `result` is prose meant for a
         // reader — it is previewed, transcribed, and appended to below — while
         // this is a machine-readable payload one caller asked for by schema.
         record.structuredJson = structuredJson;
         record.structuredRetried = structuredRetried;
-        record.session = session;
+        if (unboundSession) void shutdownChildSession(session);
+        else record.session = session;
 
         detach();
 
@@ -900,8 +906,12 @@ export class AgentManager {
           record.outputCleanup = undefined;
         }
 
-        // Clean up worktree if used
-        if (record.worktree) {
+        // An abandoned run's tool may still be writing in the worktree, so
+        // committing and removing it now could lose that work: keep it.
+        if (record.worktree && abandoned) {
+          record.result = (record.result ?? "") +
+            `\n\n---\nThe agent was stopped while a tool call was still running, so its worktree was kept: \`${record.worktree.path}\`.`;
+        } else if (record.worktree) {
           // The one moment the child's tree still exists and the child is done
           // writing to it. try/catch, not decoration: a hook that throws must
           // not leave the worktree behind.
@@ -993,6 +1003,7 @@ export class AgentManager {
    * the acquire.
    */
   private settleRun(record: AgentRecord, guardCallback: boolean): void {
+    record.stopping = undefined;
     if (!record.isBackground) record.resultConsumed = true;
     // Nobody waits on a settled run; a later foreground resume must not look
     // like a spawn `sendToBackground` could hand off.
@@ -1179,6 +1190,11 @@ export class AgentManager {
   ): Promise<AgentRecord | undefined> {
     const record = this.agents.get(id);
     if (!record?.session) return undefined;
+    // A stopped run still settling owns the record until it does, and one that
+    // was given up on can leave its session busy with a tool call — pi would
+    // reject the prompt, and the record would lose the stopped run's result to
+    // that error. Refuse both before touching anything.
+    if (record.stopping || record.session.isStreaming) return undefined;
 
     // Background resume: settle asynchronously and notify on completion exactly
     // like a background spawn, returning immediately with the record still
@@ -1202,6 +1218,8 @@ export class AgentManager {
       record.resultConsumed = false;
       record.result = undefined;
       record.error = undefined;
+      record.limit = undefined;
+      record.stoppedByCaller = undefined;
       record.completedAt = undefined;
       record.status = "queued";
 
@@ -1239,6 +1257,8 @@ export class AgentManager {
     record.completedAt = undefined;
     record.result = undefined;
     record.error = undefined;
+    record.limit = undefined;
+    record.stoppedByCaller = undefined;
     // Fresh controller, as on the detached path: `abort()` fires whatever
     // `record.abortController` holds, and the spawn's has long settled — so a
     // stop from `/agents` or the caller's Esc would mark the record stopped
@@ -1251,30 +1271,36 @@ export class AgentManager {
     // holds for a resume issued on a call that was cancelled first.
     if (signal?.aborted) this.abort(id);
 
-    try {
-      this.settleOutcome(record, await resumeAgent(record.session, prompt, {
-        type: record.type,
-        maxTurns: options?.maxTurns ?? record.invocation?.maxTurns,
-        onTurnEnd: options?.onTurnEnd,
-        onToolActivity: (activity) => {
-          if (activity.type === "end") record.toolUses++;
-          options?.onToolActivity?.(activity);
-        },
-        onAssistantUsage: (usage) => {
-          addUsage(record.lifetimeUsage, usage);
-          this.onUsage?.(record, usage);
-          options?.onAssistantUsage?.(usage);
-        },
-        onCompaction: (info) => {
-          record.compactionCount++;
-          this.onCompact?.(record, info);
-          options?.onCompaction?.(info);
-        },
-        signal: abortController.signal,
-      }));
-    } catch (err) {
-      this.failResume(record, err);
-    }
+    const run = resumeAgent(record.session, prompt, {
+      type: record.type,
+      maxTurns: options?.maxTurns ?? record.invocation?.maxTurns,
+      maxMinutes: options?.maxMinutes ?? record.invocation?.maxMinutes,
+      onTurnEnd: options?.onTurnEnd,
+      onToolActivity: (activity) => {
+        if (activity.type === "end") record.toolUses++;
+        options?.onToolActivity?.(activity);
+      },
+      onAssistantUsage: (usage) => {
+        addUsage(record.lifetimeUsage, usage);
+        this.onUsage?.(record, usage);
+        options?.onAssistantUsage?.(usage);
+      },
+      onCompaction: (info) => {
+        record.compactionCount++;
+        this.onCompact?.(record, info);
+        options?.onCompaction?.(info);
+      },
+      signal: abortController.signal,
+    })
+      .then(
+        (outcome) => { this.settleOutcome(record, outcome); return outcome.text; },
+        (err) => { this.failResume(record, err); return ""; },
+      );
+    // The record's promise is this run's, so a stop or a wait on the record
+    // follows the resume rather than the settled spawn before it.
+    record.promise = run;
+    await run;
+    record.stopping = undefined;
     this.detachParentAbort(record);
 
     // Same contract as the spawn settle paths: children spawned during the
@@ -1294,8 +1320,9 @@ export class AgentManager {
    */
   private settleOutcome(
     record: AgentRecord,
-    { text, failure, aborted, steered }: Awaited<ReturnType<typeof resumeAgent>>,
+    { text, failure, aborted, steered, limit }: Awaited<ReturnType<typeof resumeAgent>>,
   ): void {
+    record.limit = limit;
     if (record.status !== "stopped") {
       if (aborted) {
         record.status = "aborted";
@@ -1360,6 +1387,7 @@ export class AgentManager {
     try { options.onStarted?.(); } catch { /* ignore caller wiring errors */ }
 
     const settle = () => {
+      record.stopping = undefined;
       detachParentSignal?.();
       detachParentSignal = undefined;
       // Final flush of streaming output file
@@ -1377,6 +1405,7 @@ export class AgentManager {
     const promise = resumeAgent(record.session, prompt, {
       type: record.type,
       maxTurns: options.maxTurns ?? record.invocation?.maxTurns,
+      maxMinutes: options.maxMinutes ?? record.invocation?.maxMinutes,
       onTurnEnd: options.onTurnEnd,
       onToolActivity: (activity) => {
         if (activity.type === "end") record.toolUses++;
@@ -1535,6 +1564,8 @@ export class AgentManager {
     record.abortController?.abort();
     record.status = "stopped";
     record.completedAt = Date.now();
+    // No promise yet means a worktree copy, which startAgent discards on its own.
+    if (record.promise) record.stopping = true;
     return true;
   }
 

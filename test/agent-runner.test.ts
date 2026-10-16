@@ -138,11 +138,13 @@ import {
   resolveEffectiveMaxTurns,
   resumeAgent,
   runAgent,
+  STOP_SETTLE_TIMEOUT_MS,
   SUBAGENT_TOOL_NAMES,
   setDefaultMaxTurns,
   setGraceTurns,
   setRememberAgents,
 } from "../src/agent-runner.js";
+import { detectEnv } from "../src/env.js";
 import { compileJsonSchema } from "../src/workflow/json-schema.js";
 
 /** The most recent session built by `createSession` — read by `lastToolsPassed()`. */
@@ -2902,6 +2904,184 @@ describe("agent-runner turn limits", () => {
       await resumeWithTurns(3, { maxTurns: 10, onTurnEnd });
       expect(onTurnEnd.mock.calls.map(c => c[0])).toEqual([1, 2, 3]);
     });
+  });
+});
+
+// `max_minutes` and the stop deadline share the turn limit's run observer, but
+// are driven by timers rather than turn_end events.
+describe("agent-runner time limit and stop deadline", () => {
+  beforeEach(() => { vi.useFakeTimers(); });
+  afterEach(() => { vi.useRealTimers(); });
+
+  /**
+   * A session whose prompt runs until `session.abort()` — or forever, when
+   * `ignoresAbort` is set, like a tool that never checks its signal.
+   */
+  function hangingSession(ignoresAbort = false) {
+    const { session } = createSession("unused");
+    session.steer.mockResolvedValue(undefined);
+    let finish = () => {};
+    session.prompt.mockImplementation(() => new Promise<void>((resolve) => {
+      session.messages.push({ role: "assistant", content: [{ type: "text", text: "partial work" }] });
+      finish = resolve;
+    }));
+    session.abort.mockImplementation(async () => { if (!ignoresAbort) finish(); });
+    return session;
+  }
+
+  /** Start the run and let it reach its prompt; the run promise comes back wrapped so it is not awaited here. */
+  async function startRun(session: ReturnType<typeof hangingSession>, options: Record<string, unknown>) {
+    vi.mocked(getAgentConfig).mockReturnValueOnce(makeAgentConfig());
+    createAgentSession.mockResolvedValue({ session });
+    const run = runAgent(ctx, "Explore", "go", { pi, ...options });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(session.prompt).toHaveBeenCalled();
+    return { run };
+  }
+
+  it("steers at max_minutes and hard-aborts one minute later", async () => {
+    const session = hangingSession();
+    const { run } = await startRun(session, { maxMinutes: 2 });
+
+    await vi.advanceTimersByTimeAsync(2 * 60_000 - 1);
+    expect(session.steer).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(1);
+    expect(session.steer).toHaveBeenCalledTimes(1);
+    expect(session.steer.mock.calls[0][0]).toContain("time limit");
+    expect(session.abort).not.toHaveBeenCalled();
+
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(session.abort).toHaveBeenCalled();
+    await expect(run).resolves.toMatchObject({ aborted: true, steered: true, limit: "time", responseText: "partial work" });
+  });
+
+  it("leaves no timer behind when the run finishes inside its time limit", async () => {
+    vi.mocked(getAgentConfig).mockReturnValueOnce(makeAgentConfig());
+    const { session } = createSession("done");
+    createAgentSession.mockResolvedValue({ session });
+
+    const result = await runAgent(ctx, "Explore", "go", { pi, maxMinutes: 1 });
+    await vi.advanceTimersByTimeAsync(5 * 60_000);
+
+    expect(result).toMatchObject({ steered: false, aborted: false, limit: undefined });
+    expect(session.steer).not.toHaveBeenCalled();
+    expect(session.abort).not.toHaveBeenCalled();
+  });
+
+  it("settles a stopped run whose prompt never returns, with its partial output (#318)", async () => {
+    const session = hangingSession(true);
+    const controller = new AbortController();
+    const { run } = await startRun(session, { signal: controller.signal });
+    let settled = false;
+    void run.then(() => { settled = true; });
+
+    controller.abort();
+    expect(session.abort).toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(STOP_SETTLE_TIMEOUT_MS - 1);
+    expect(settled).toBe(false);
+    await vi.advanceTimersByTimeAsync(1);
+    await expect(run).resolves.toMatchObject({ responseText: "partial work", abandoned: true });
+  });
+
+  it("does not mark a run abandoned when its prompt unwinds in time", async () => {
+    const session = hangingSession();
+    const controller = new AbortController();
+    const { run } = await startRun(session, { signal: controller.signal });
+
+    controller.abort();
+
+    const result = await run;
+    expect(result.abandoned).toBeUndefined();
+  });
+
+  it("gives up on a stop while session_start never returns, handing the session back", async () => {
+    vi.mocked(getAgentConfig).mockReturnValueOnce(makeAgentConfig());
+    const { session } = createSession("unused");
+    session.bindExtensions.mockImplementation(() => new Promise(() => {}));
+    createAgentSession.mockResolvedValue({ session });
+    const controller = new AbortController();
+    const run = runAgent(ctx, "Explore", "go", { pi, signal: controller.signal });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(session.bindExtensions).toHaveBeenCalled();
+
+    controller.abort();
+    await vi.advanceTimersByTimeAsync(STOP_SETTLE_TIMEOUT_MS);
+
+    await expect(run).resolves.toMatchObject({ session, abandoned: true, responseText: "" });
+    expect(session.prompt).not.toHaveBeenCalled();
+  });
+
+  it("gives up on a stop while the session is still being created, and disposes it when it arrives", async () => {
+    vi.mocked(getAgentConfig).mockReturnValueOnce(makeAgentConfig());
+    const { session } = createSession("unused");
+    (session as any).dispose = vi.fn();
+    let create!: (v: unknown) => void;
+    createAgentSession.mockReturnValue(new Promise((resolve) => { create = resolve; }));
+    const controller = new AbortController();
+    const run = runAgent(ctx, "Explore", "go", { pi, signal: controller.signal });
+    const outcome = run.then(() => "resolved", (err: Error) => err.message);
+    await vi.advanceTimersByTimeAsync(0);
+
+    controller.abort();
+    await vi.advanceTimersByTimeAsync(STOP_SETTLE_TIMEOUT_MS);
+    expect(await outcome).toBe("stopped before its session finished starting");
+
+    create({ session });
+    await vi.advanceTimersByTimeAsync(0);
+    expect((session as any).dispose).toHaveBeenCalled();
+    expect(session.prompt).not.toHaveBeenCalled();
+  });
+
+  it("bounds setup for a signal that was already aborted before the run started", async () => {
+    vi.mocked(getAgentConfig).mockReturnValueOnce(makeAgentConfig());
+    vi.mocked(detectEnv).mockReturnValueOnce(new Promise(() => {}));
+    const controller = new AbortController();
+    controller.abort();
+    const outcome = runAgent(ctx, "Explore", "go", { pi, signal: controller.signal })
+      .then(() => "resolved", (err: Error) => err.message);
+
+    await vi.advanceTimersByTimeAsync(STOP_SETTLE_TIMEOUT_MS);
+
+    expect(await outcome).toBe("stopped before its session finished starting");
+  });
+
+  it("flags a session given up on during session_start as unbound", async () => {
+    vi.mocked(getAgentConfig).mockReturnValueOnce(makeAgentConfig());
+    const { session } = createSession("unused");
+    session.bindExtensions.mockImplementation(() => new Promise(() => {}));
+    createAgentSession.mockResolvedValue({ session });
+    const controller = new AbortController();
+    const run = runAgent(ctx, "Explore", "go", { pi, signal: controller.signal });
+    await vi.advanceTimersByTimeAsync(0);
+
+    controller.abort();
+    await vi.advanceTimersByTimeAsync(STOP_SETTLE_TIMEOUT_MS);
+
+    await expect(run).resolves.toMatchObject({ unboundSession: true });
+  });
+
+  it("labels the run by the limit that fired first", async () => {
+    // Turn limit steers first; the time limit's hard abort must not relabel it.
+    const session = hangingSession();
+    const { listeners } = { listeners: [] as Array<(e: any) => void> };
+    session.subscribe.mockImplementation((l: (e: any) => void) => { listeners.push(l); return () => {}; });
+    const { run } = await startRun(session, { maxTurns: 1, maxMinutes: 1 });
+    for (const l of [...listeners]) l({ type: "turn_end" });
+    expect(session.steer.mock.calls[0][0]).toContain("turn limit");
+
+    await vi.advanceTimersByTimeAsync(2 * 60_000);
+
+    await expect(run).resolves.toMatchObject({ aborted: true, limit: "turns" });
+  });
+
+  it("bounds a resumed run by max_minutes too", async () => {
+    const session = hangingSession();
+    const run = resumeAgent(session as any, "again", { type: "Explore", maxMinutes: 1 });
+
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(session.steer).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(60_000);
+    await expect(run).resolves.toMatchObject({ aborted: true, limit: "time" });
   });
 });
 

@@ -10,23 +10,29 @@
 
 import type { AgentRecord } from "./types.js";
 
+/** What the status notes read off a record. */
+type NoteRecord = Pick<AgentRecord, "status" | "limit" | "stoppedByCaller">;
+
 /**
  * Explicit parenthetical note for a non-normal terminal outcome, so the parent
  * agent can't mistake partial output for a completed result. Empty string for a
  * clean completion (and any unknown/non-terminal status).
  *
  * `stopped` (a human aborted it) is deliberately distinct from `aborted` (the
- * turn limit was hit) — the parent should treat human intervention differently
- * from a budget cutoff.
+ * turn or time limit was hit) — the parent should treat human intervention
+ * differently from a budget cutoff. A stop the parent made itself with
+ * `stop_subagent` is not a human intervention, so it says so.
  */
-export function getStatusNote(status: string): string {
-  switch (status) {
+export function getStatusNote(record: NoteRecord): string {
+  switch (record.status) {
     case "stopped":
-      return " (STOPPED BY THE USER before completion — output is partial; the task was NOT finished)";
+      return record.stoppedByCaller
+        ? " (stopped by you with stop_subagent before completion — output is partial; the task was NOT finished)"
+        : " (STOPPED BY THE USER before completion — output is partial; the task was NOT finished)";
     case "aborted":
-      return " (aborted — hit the turn limit before completion; output may be incomplete)";
+      return ` (aborted — hit the ${limitName(record)} before completion; output may be incomplete)`;
     case "steered":
-      return " (wrapped up at the turn limit — output may be partial)";
+      return ` (wrapped up at the ${limitName(record)} — output may be partial)`;
     default:
       return "";
   }
@@ -66,17 +72,24 @@ export function getStatusNote(status: string): string {
  * behavior) and adding an instruction (which can) are not equally safe bets.
  * Don't add either back without a way to measure it.
  */
-export function getForegroundOutcomeNote(status: string): string {
-  switch (status) {
+export function getForegroundOutcomeNote(record: NoteRecord): string {
+  switch (record.status) {
     case "stopped":
-      return " (STOPPED BY THE USER — everything the agent produced is above; the task is unfinished)";
+      return record.stoppedByCaller
+        ? " (stopped by you with stop_subagent — everything the agent produced is above; the task is unfinished)"
+        : " (STOPPED BY THE USER — everything the agent produced is above; the task is unfinished)";
     case "aborted":
-      return " (aborted at the turn limit — everything the agent produced is above; the task is unfinished)";
+      return ` (aborted at the ${limitName(record)} — everything the agent produced is above; the task is unfinished)`;
     case "steered":
-      return " (wrapped up at the turn limit — everything the agent produced is above; the task may be unfinished)";
+      return ` (wrapped up at the ${limitName(record)} — everything the agent produced is above; the task may be unfinished)`;
     default:
       return "";
   }
+}
+
+/** "turn limit" or "time limit", for the limit that steered or aborted the run. */
+export function limitName(record: Pick<AgentRecord, "limit">): string {
+  return record.limit === "time" ? "time limit" : "turn limit";
 }
 
 /**

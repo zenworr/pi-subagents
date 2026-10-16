@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **`stop_subagent` lets the model stop an agent it started.** Until now only a person could stop one, from `/agents` or with Esc on a blocking call, so a model whose background agent ran the wrong task could only steer it or wait. The tool takes an id or handle, stops a running or queued agent at once, and returns its partial output as a read result, so no completion notification follows. The status note says the parent stopped it, not the user. Nested agents get an ownership-scoped `stop_subagent` too. See [`stop_subagent`](README.md#stop_subagent).
+- **`get_subagent_result` without `agent_id` lists every agent** with its id, handle, status, description, duration, tool uses, tokens, and whether a finished result is unread. After a compaction the model can find the ids it started again. A nested parent sees only its own children.
+- **`get_subagent_result` takes `timeout_ms`** (refs [#229](https://github.com/tintinweb/pi-subagents/issues/229)). With `wait: true`, the wait ends after that many milliseconds and reports the agent as still running. Only the wait ends: the agent keeps running and its notification still arrives.
+- **`Agent` takes `max_minutes`, a wall-clock limit.** At the limit the agent is steered to wrap up; one minute later the run is aborted with its partial output. A resume without one keeps the spawn's limit. `steered` and `aborted` results now say whether the `turn limit` or the `time limit` fired. Also accepted as `maxMinutes` on `subagents:rpc:spawn`. See [Graceful limits](README.md#graceful-limits).
+
+### Fixed
+- **A stopped run can no longer stay `running` forever** (refs [#318](https://github.com/tintinweb/pi-subagents/issues/318)). A stop aborts the session's prompt, but a tool that ignored its abort signal, or an extension whose `session_start` never returned, kept the record's promise pending: the agent held its concurrency slot, never notified, and `get_subagent_result(wait: true)` never returned. Every stop — `stop_subagent`, `/agents`, Esc, RPC, and the turn and time limits — now gives up on the run 5 seconds later at the latest and settles it with the output produced so far; a worktree copy in progress when the stop lands finishes first. Because the tool may still be running, such a run keeps its worktree instead of committing and removing it, a session given up on during `session_start` is shut down rather than kept, and a resume is refused until the run has settled and the tool has returned.
+- **A stopped agent's result is no longer read before it exists.** A stop marks the record `stopped` at once, but its partial output lands only when the run unwinds. In that window `get_subagent_result` returned "No output.", marked it read, and so suppressed the notification that would have carried the output. It now reports the agent as stopping, `wait: true` waits for the output, and the RPC `consume` refuses as for a running agent.
+- **A foreground resume exposes its own run on the record.** `record.promise` still pointed at the settled spawn, so a stop or wait on a foreground resume returned before the resumed run had ended.
+
 ## [0.22.1] - 2026-10-14
 
 ### Added
