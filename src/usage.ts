@@ -133,7 +133,17 @@ export type SessionStatsLike = {
   tokens: { input: number; output: number; cacheWrite: number };
   contextUsage?: { percent: number | null };
 };
-export type SessionLike = { getSessionStats(): SessionStatsLike };
+export type SessionLike = {
+  getSessionStats(): SessionStatsLike;
+  sessionManager?: { getLeafId(): string | null };
+  model?: unknown;
+};
+
+const contextPercentCache = new WeakMap<SessionLike, {
+  leafId: string | null;
+  model: unknown;
+  percent: number | null;
+}>();
 
 /**
  * Session-scoped token count: input + output + cacheWrite as reported by
@@ -162,6 +172,12 @@ export function getSessionTokens(session: SessionLike | undefined): number {
  */
 export function getSessionContextPercent(session: SessionLike | undefined): number | null {
   if (!session) return null;
-  try { return session.getSessionStats().contextUsage?.percent ?? null; }
-  catch { return null; }
+  try {
+    const leafId = session.sessionManager?.getLeafId();
+    const cached = contextPercentCache.get(session);
+    if (cached && cached.leafId === leafId && cached.model === session.model) return cached.percent;
+    const percent = session.getSessionStats().contextUsage?.percent ?? null;
+    if (leafId !== undefined) contextPercentCache.set(session, { leafId, model: session.model, percent });
+    return percent;
+  } catch { return null; }
 }

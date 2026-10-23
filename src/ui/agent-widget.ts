@@ -591,6 +591,7 @@ export class AgentWidget {
       else if (a.completedAt && this.shouldShowFinished(a.id, a.status)) { hasFinished = true; }
     }
     const hasActive = runningCount > 0 || queuedCount > 0;
+    if (!hasActive && this.widgetInterval) { clearInterval(this.widgetInterval); this.widgetInterval = undefined; }
 
     // Nothing to show — clear widget
     if (!hasActive && !hasFinished) {
@@ -603,7 +604,6 @@ export class AgentWidget {
         this.uiCtx.setStatus("subagents", undefined);
         this.lastStatusText = undefined;
       }
-      if (this.widgetInterval) { clearInterval(this.widgetInterval); this.widgetInterval = undefined; }
       // Clean up stale entries
       for (const [id] of this.finishedTurnAge) {
         if (!allAgents.some(a => a.id === id)) this.finishedTurnAge.delete(id);
