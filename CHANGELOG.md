@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+- **Development dependencies no longer contain known npm audit vulnerabilities.** Update Vitest and its coverage package, and override undici in the Pi 1.1.0 compatibility test dependency. Runtime dependencies and the Pi compatibility floor are unchanged.
+
 ### Added
 - **`stop_subagent` lets the model stop an agent it started.** Until now only a person could stop one, from `/agents` or with Esc on a blocking call, so a model whose background agent ran the wrong task could only steer it or wait. The tool takes an id or handle, stops a running or queued agent at once, and returns its partial output as a read result, so no completion notification follows. The status note says the parent stopped it, not the user. Nested agents get an ownership-scoped `stop_subagent` too. See [`stop_subagent`](README.md#stop_subagent).
 - **`get_subagent_result` without `agent_id` lists every agent** with its id, handle, status, description, duration, tool uses, tokens, and whether a finished result is unread. After a compaction the model can find the ids it started again. A nested parent sees only its own children.
