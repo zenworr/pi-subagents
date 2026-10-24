@@ -21,6 +21,7 @@ jobs:
           fetch-depth: 0
           ref: pi-package
       - name: Merge upstream master
+        id: merge
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
@@ -30,4 +31,24 @@ jobs:
             exit 0
           fi
           git merge --no-edit upstream/master
-          git push origin HEAD:pi-package
+          echo "merged=true" >> "$GITHUB_OUTPUT"
+      # pi installs this branch directly, so a merge that breaks a check
+      # (including the test/perf guards) must fail here instead of shipping.
+      - uses: actions/setup-node@v4
+        if: steps.merge.outputs.merged == 'true'
+        with:
+          node-version: 22
+          cache: npm
+      - if: steps.merge.outputs.merged == 'true'
+        run: npm ci
+      - if: steps.merge.outputs.merged == 'true'
+        run: npm run check
+      # A bot push does not trigger ci.yml, so its current-Pi job runs here.
+      - name: Check against current Pi
+        if: steps.merge.outputs.merged == 'true'
+        run: |
+          npm install --no-save @earendil-works/pi-coding-agent@latest @earendil-works/pi-ai@latest @earendil-works/pi-tui@latest
+          npm run typecheck
+          npx vitest run --reporter=dot
+      - if: steps.merge.outputs.merged == 'true'
+        run: git push origin HEAD:pi-package
