@@ -5,6 +5,7 @@
  * Subscribes to session events for real-time streaming updates.
  */
 
+import type { AssistantMessage } from "@earendil-works/pi-ai";
 import { type AgentSession, getMarkdownTheme } from "@earendil-works/pi-coding-agent";
 import { type Component, type Focusable, Input, Markdown, type MarkdownOptions, type MarkdownTheme, matchesKey, type OverlayOptions, ScrollView, type ScrollViewScrollbar, stripTerminalSequences, type TUI, type TuiMouseEvent, type TuiMouseEventResult, truncateToWidth, visibleWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
 import { renderAgentName } from "../agent-color.js";
@@ -171,6 +172,12 @@ export class ConversationViewer implements Component, Focusable {
    * each one is wrapped once per width and mode instead of on every frame.
    */
   private lineCache = new WeakMap<object, { width: number; mode: ViewerMarkdownMode; content: unknown; lines: string[] | null }>();
+  /**
+   * Lines of the reply being written. Keyed by what it displays, not by object:
+   * pi sends a new shallow copy on every update, including thinking deltas that
+   * change nothing shown here, and highlighted code is costly to re-clamp.
+   */
+  private streamingLines: { key: string; width: number; mode: ViewerMarkdownMode; lines: string[] | null } | undefined;
   private closed = false;
   /** Two-press confirm guard for the stop key, so a stray key can't kill the agent. */
   private stopArmed = false;
@@ -673,6 +680,7 @@ export class ConversationViewer implements Component, Focusable {
 
   invalidate(): void {
     this.lineCache = new WeakMap();
+    this.streamingLines = undefined;
   }
 
   dispose(): void {
@@ -731,7 +739,7 @@ export class ConversationViewer implements Component, Focusable {
       for (const line of msgLines) lines.push(line);
     };
     for (const msg of messages) append(this.cachedMessageLines(msg, width, mode));
-    if (streamingReply) append(this.messageLines(streamingReply, width, mode));
+    if (streamingReply) append(this.streamingReplyLines(streamingReply, width, mode));
 
     // Streaming indicator for running agents. Not while reply text streams in
     // above: the indicator would only repeat it.
@@ -752,6 +760,17 @@ export class ConversationViewer implements Component, Focusable {
     if (hit && hit.width === width && hit.mode === mode && hit.content === content) return hit.lines;
     const lines = this.messageLines(msg, width, mode);
     this.lineCache.set(msg, { width, mode, content, lines });
+    return lines;
+  }
+
+  private streamingReplyLines(msg: AssistantMessage, width: number, mode: ViewerMarkdownMode): string[] | null {
+    // Only text and tool-call names reach the output of messageLines().
+    const key = JSON.stringify(msg.content.flatMap((c): (string | string[])[] =>
+      c.type === "text" ? [c.text] : c.type === "toolCall" ? [[(c as any).name ?? (c as any).toolName]] : []));
+    const hit = this.streamingLines;
+    if (hit && hit.key === key && hit.width === width && hit.mode === mode) return hit.lines;
+    const lines = this.messageLines(msg, width, mode);
+    this.streamingLines = { key, width, mode, lines };
     return lines;
   }
 

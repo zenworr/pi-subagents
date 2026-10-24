@@ -8,8 +8,11 @@
  * in-memory session manager, without model calls or persisted sessions.
  */
 
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { type ExtensionContext, type SessionEntry, SessionManager } from "@earendil-works/pi-coding-agent";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { buildParentContext, extractText } from "../src/context.js";
 
 function makeCtx(entries: unknown[]): ExtensionContext {
@@ -181,5 +184,48 @@ describe("buildParentContext", () => {
     );
     expect(out).toContain("[User]: question");
     expect(out).not.toContain("[Assistant]:");
+  });
+
+  // A parallel fan-out of inheriting agents spawns from one leaf; on a long
+  // parent session each rebuild costs a full branch scan.
+  it("reuses the text while the leaf is unchanged, and rebuilds when it moves", () => {
+    const sessionManager = SessionManager.inMemory();
+    const first = sessionManager.appendMessage({ role: "user", content: "first", timestamp: 0 });
+    const getBranch = vi.spyOn(sessionManager, "getBranch");
+    const ctx = { sessionManager } as ExtensionContext;
+
+    const out = buildParentContext(ctx);
+    expect(buildParentContext(ctx)).toBe(out);
+    expect(getBranch.mock.calls.length).toBeLessThanOrEqual(1);
+
+    sessionManager.appendMessage({ role: "user", content: "second", timestamp: 1 });
+    expect(buildParentContext(ctx)).toContain("[User]: second");
+
+    sessionManager.branch(first);
+    expect(buildParentContext(ctx)).not.toContain("second");
+  });
+
+  // Entry IDs are unique per session file only; a reused manager can load
+  // another file whose leaf has the same ID.
+  it("does not reuse text across session files with the same leaf ID", () => {
+    const dir = mkdtempSync(join(tmpdir(), "subagents-context-"));
+    try {
+      const file = (name: string) => {
+        const path = join(dir, `${name}.jsonl`);
+        writeFileSync(path, [
+          { type: "session", version: 3, id: name, cwd: dir, timestamp: "2026-01-01T00:00:00Z" },
+          { type: "message", id: "aabbccdd", parentId: null, timestamp: "2026-01-01T00:00:01Z", message: { role: "user", content: name, timestamp: 1 } },
+        ].map((e) => JSON.stringify(e)).join("\n") + "\n");
+        return path;
+      };
+      const sessionManager = SessionManager.open(file("one"), dir);
+      const ctx = { sessionManager } as ExtensionContext;
+      expect(buildParentContext(ctx)).toContain("[User]: one");
+
+      sessionManager.setSessionFile(file("two"));
+      expect(buildParentContext(ctx)).toContain("[User]: two");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 });

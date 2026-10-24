@@ -18,6 +18,21 @@ export function extractText(content: unknown[]): string {
  * into what has been discussed/done so far.
  */
 export function buildParentContext(ctx: ExtensionContext): string {
+  // Entries are append-only and a new entry moves the leaf, so the leaf entry
+  // fixes the branch. A parallel fan-out then builds this text once, not once per
+  // child. Keyed by the entry object, not its ID: IDs are unique only within one
+  // session file, and a manager can be switched to another file.
+  const leaf = ctx.sessionManager.getLeafEntry?.();
+  const hit = parentContextCache.get(ctx.sessionManager);
+  if (leaf && hit?.leaf === leaf) return hit.text;
+  const text = renderParentContext(ctx);
+  if (leaf) parentContextCache.set(ctx.sessionManager, { leaf, text });
+  return text;
+}
+
+const parentContextCache = new WeakMap<object, { leaf: object; text: string }>();
+
+function renderParentContext(ctx: ExtensionContext): string {
   // Pi applies the latest compaction boundary, including custom compactor summaries.
   const { messages } = buildSessionContext(ctx.sessionManager.getBranch());
   const parts: string[] = [];

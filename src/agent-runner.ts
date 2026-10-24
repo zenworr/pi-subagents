@@ -265,8 +265,11 @@ export function installExtensionToolScope(
   const inScope = (): Set<string> => {
     const keep = new Set(toolNames.filter((t) => !disallowedSet?.has(t)));
     const optInActive = extNames.size > 0;
+    // Aliases only serve selector matching, and resolving them reads package
+    // manifests from disk — this runs on every tool call.
+    const needsAliases = optInActive || narrowing.size > 0;
     for (const extension of loader.getExtensions().extensions) {
-      const canons = extensionCanonicalNames(extension.path);
+      const canons = needsAliases ? extensionCanonicalNames(extension.path) : [];
       if (optInActive && !canons.some((c) => extNames.has(c))) continue;
       // First alias that carries a narrowing set — a user won't narrow one
       // extension under two different names, so first-match is correct.

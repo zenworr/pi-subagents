@@ -45,7 +45,7 @@ vi.mock("@earendil-works/pi-tui", async (importOriginal) => {
 // After the mock, so the subjects bind the counting versions.
 const { AgentWidget } = await import("../../src/ui/agent-widget.js");
 const { ConversationViewer } = await import("../../src/ui/conversation-viewer.js");
-const { makeActivity, makeFleet, makeSession, mountViewer, perfTheme, perfTui } = await import(
+const { makeActivity, makeFleet, makeRecord, makeSession, mountViewer, perfTheme, perfTui } = await import(
   "../helpers/perf-fixtures.js"
 );
 
@@ -109,6 +109,85 @@ describe("ConversationViewer — cost stays linear in transcript length", () => 
     viewer.render(120);
 
     expect(counts.markdownNew).toBe(afterFirst);
+  });
+});
+
+describe.each([false, true])("ConversationViewer — a streaming reply is formatted once per change (fullscreen: %s)", (fullscreen) => {
+  function streamingViewer(text: string, mode = "assistant") {
+    const content: any[] = [{ type: "text", text }];
+    const session: any = { ...makeSession(0), agent: { state: { streamingMessage: { role: "assistant", content } } } };
+    let current = mode;
+    const viewer = new ConversationViewer(
+      { ...perfTui(120, 40), mode: fullscreen ? "fullscreen" : "regular" }, session, makeRecord(0), undefined, perfTheme, () => {},
+      undefined, undefined, undefined, false, () => current,
+    );
+    expect((viewer as any).fullscreen).toBe(fullscreen);
+    return { viewer, session, content, setMode: (m: string) => { current = m; } };
+  }
+  const shown = (viewer: any, width = 120) => viewer.render(width).join("\n");
+  const work = () => counts.wrap + counts.markdownRender;
+  const reset = () => { counts.wrap = 0; counts.markdownRender = 0; };
+
+  // pi sends every delta as a new shallow copy, and most frames (thinking,
+  // argument deltas, widget ticks) change nothing this view shows.
+  it("reuses the lines across shallow copies that show nothing new", () => {
+    const { viewer, session, content } = streamingViewer("```js\nconst a = 1;\n```");
+    viewer.render(120);
+    reset();
+
+    content.unshift({ type: "thinking", thinking: "more" });
+    session.agent.state.streamingMessage = { role: "assistant", content: [...content] };
+    viewer.render(120);
+
+    expect(work()).toBe(0);
+  });
+
+  it("formats again when the text, a text block, a tool call, the width, or the mode changes", () => {
+    const { viewer, session, content, setMode } = streamingViewer("first");
+    viewer.render(120);
+    const next = (blocks: any[]) => { session.agent.state.streamingMessage = { role: "assistant", content: blocks }; };
+
+    content[0].text = "first second";
+    next([...content]);
+    expect(shown(viewer)).toContain("first second");
+
+    next([...content, { type: "text", text: "another block" }]);
+    expect(shown(viewer)).toContain("another block");
+
+    next([...content, { type: "toolCall", name: "grep" }]);
+    expect(shown(viewer)).toContain("[Tool: grep]");
+
+    reset();
+    viewer.render(100);
+    expect(work()).toBeGreaterThan(0);
+
+    next([{ type: "text", text: "# Heading" }]);
+    expect(shown(viewer, 100)).not.toContain("# Heading");
+    setMode("off");
+    expect(shown(viewer, 100)).toContain("# Heading");
+  });
+
+  it("formats again after invalidate()", () => {
+    const { viewer } = streamingViewer("text");
+    viewer.render(120);
+    reset();
+    viewer.invalidate();
+    viewer.render(120);
+    expect(work()).toBeGreaterThan(0);
+  });
+
+  it("shows the next reply, not the cached one, after the stream ends", () => {
+    const { viewer, session } = streamingViewer("reply one");
+    expect(shown(viewer)).toContain("reply one");
+
+    session.messages.push({ role: "assistant", content: [{ type: "text", text: "reply one" }] });
+    session.agent.state.streamingMessage = undefined;
+    expect(shown(viewer)).toContain("reply one");
+
+    session.agent.state.streamingMessage = { role: "assistant", content: [{ type: "text", text: "reply two" }] };
+    const out = shown(viewer);
+    expect(out).toContain("reply two");
+    expect(out.match(/reply one/g)).toHaveLength(1);
   });
 });
 
